@@ -406,8 +406,23 @@ echo -e "Code ID: ${GREEN}$CODE_ID${NC}"
 echo -e "\n${YELLOW}Note: Contract will be instantiated by the frontend.${NC}"
 echo -e "${YELLOW}Each circle will create a new unique contract instance.${NC}"
 
+# Update codeId in chain config file
+echo -e "\n${GREEN}[4/5] Updating codeId in chain config file...${NC}"
+FRONTEND_CHAIN_CONFIG="$FRONTEND_DIR/chain/$NETWORK/safrochain.json"
+if [[ -f "$FRONTEND_CHAIN_CONFIG" ]]; then
+    # Create backup
+    cp "$FRONTEND_CHAIN_CONFIG" "$FRONTEND_CHAIN_CONFIG.bak"
+    # Update codeId using jq
+    jq ".codeId = $CODE_ID" "$FRONTEND_CHAIN_CONFIG" > "$FRONTEND_CHAIN_CONFIG.tmp" && mv "$FRONTEND_CHAIN_CONFIG.tmp" "$FRONTEND_CHAIN_CONFIG"
+    echo -e "${GREEN}Updated codeId in: ${YELLOW}$FRONTEND_CHAIN_CONFIG${NC}"
+    echo -e "  ${GREEN}codeId: ${YELLOW}$CODE_ID${NC}"
+else
+    echo -e "${YELLOW}Warning: Frontend chain config not found at $FRONTEND_CHAIN_CONFIG${NC}"
+    echo -e "${YELLOW}Please update codeId manually in the chain config file.${NC}"
+fi
+
 # Save to .env file in frontend
-echo -e "\n${GREEN}[4/4] Saving contract CODE ID to frontend .env file...${NC}"
+echo -e "\n${GREEN}[5/5] Saving contract CODE ID to frontend .env file...${NC}"
 ENV_FILE="$FRONTEND_DIR/.env"
 ENV_LOCAL_FILE="$FRONTEND_DIR/.env.local"
 

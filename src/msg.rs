@@ -17,6 +17,7 @@ pub enum ExecuteMsg {
     CreateCircle {
         circle_name: String,
         circle_description: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
         circle_image: Option<String>,
         max_members: u32,
         min_members_required: u32,
@@ -26,13 +27,16 @@ pub enum ExecuteMsg {
         late_fee_amount: Uint128,
         total_cycles: u32,
         cycle_duration_days: u32,
+        #[serde(skip_serializing_if = "Option::is_none")]
         start_date: Option<Timestamp>,
         grace_period_hours: u32,
         auto_start_when_full: bool,
         payout_order_type: PayoutOrderType,
+        #[serde(skip_serializing_if = "Option::is_none")]
         payout_order_list: Option<Vec<Addr>>,
         auto_payout_enabled: bool,
         manual_trigger_enabled: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
         arbiter_address: Option<Addr>,
         emergency_stop_enabled: bool,
         auto_refund_if_min_not_met: bool,
@@ -41,6 +45,7 @@ pub enum ExecuteMsg {
         member_exit_allowed_before_start: bool,
         visibility: Visibility,
         show_member_identities: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
         arbiter_fee_percent: Option<u64>,
     },
     JoinCircle {
