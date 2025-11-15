@@ -9,6 +9,7 @@ use crate::query::{
     query_member_balance, query_member_deposits, query_member_stats, query_payout_history,
     query_payouts, query_penalties, query_refunds, query_circles,
 };
+use crate::state::PlatformConfig;
 
 const CONTRACT_NAME: &str = "crates.io:safrimba-contract";
 const CONTRACT_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -23,15 +24,18 @@ pub fn instantiate(
     set_contract_version(deps.storage, CONTRACT_NAME, CONTRACT_VERSION)?;
 
     // Validate platform address
-    deps.api.addr_validate(msg.platform_address.as_str())?;
+    let platform_address = deps.api.addr_validate(msg.platform_address.as_str())?;
 
     // Store platform configuration
-    // In a full implementation, you'd store this in state
-    // For now, we'll just validate it
+    let platform_config = PlatformConfig {
+        platform_fee_percent: msg.platform_fee_percent,
+        platform_address: platform_address.clone(),
+    };
+    crate::state::PLATFORM_CONFIG.save(deps.storage, &platform_config)?;
 
     Ok(Response::new()
         .add_attribute("method", "instantiate")
-        .add_attribute("platform_address", msg.platform_address.to_string())
+        .add_attribute("platform_address", platform_address.to_string())
         .add_attribute("platform_fee_percent", msg.platform_fee_percent.to_string()))
 }
 

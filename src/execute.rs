@@ -9,7 +9,7 @@ use crate::msg::ExecuteMsg;
 use crate::state::{
     Circle, CircleStatus, DepositRecord, EventLog, PayoutOrderType,
     PayoutRecord, PenaltyRecord, RefundMode, Visibility, CIRCLE_COUNTER, CIRCLES, DEPOSITS, EVENTS,
-    EVENT_COUNTER, PAYOUTS, PENALTIES,
+    EVENT_COUNTER, PAYOUTS, PENALTIES, PLATFORM_CONFIG,
 };
 
 pub fn execute(
@@ -176,6 +176,8 @@ fn execute_create_circle(
             msg: "contribution_amount must be greater than 0".to_string(),
         });
     }
+    // Validate payout_order_list if provided
+    // For PredefinedOrder (FIFO), if list is None, we'll use join order when circle starts
     if let Some(ref order_list) = payout_order_list {
         if order_list.len() as u32 != max_members {
             return Err(ContractError::InvalidParameters {
@@ -201,17 +203,21 @@ fn execute_create_circle(
         })?;
 
     // Calculate end date if start_date is provided
+    // One cycle = all members receive once = max_members rounds
+    // Total duration = cycle_duration_days * max_members * total_cycles
     let end_date = start_date.map(|start| {
         Timestamp::from_seconds(
             start.seconds()
-                + (cycle_duration_days as u64 * total_cycles as u64 * 86400),
+                + (cycle_duration_days as u64 * max_members as u64 * total_cycles as u64 * 86400),
         )
     });
 
-    // Initialize payout order list if random
+    // Initialize payout order list
+    // For PredefinedOrder: if list is provided, use it; if None, will use join order (FIFO) when circle starts
+    // For RandomOrder: will be generated when circle starts
     let final_payout_order = match payout_order_type {
         PayoutOrderType::RandomOrder => None, // Will be generated when circle starts
-        PayoutOrderType::PredefinedOrder => payout_order_list,
+        PayoutOrderType::PredefinedOrder => payout_order_list, // If None, will use members_list (FIFO) when circle starts
     };
 
     let circle = Circle {
@@ -233,7 +239,7 @@ fn execute_create_circle(
         payout_amount,
         penalty_fee_amount,
         late_fee_amount,
-        platform_fee_percent: 0, // Will be set from config
+        platform_fee_percent: PLATFORM_CONFIG.load(deps.storage)?.platform_fee_percent,
         arbiter_fee_percent,
         total_cycles,
         cycle_duration_days,
@@ -518,19 +524,26 @@ fn execute_start_circle(
         });
     }
 
-    // Generate random payout order if needed
-    // Note: In production, use a proper random oracle or commit-reveal scheme
-    // For now, we'll use a deterministic shuffle based on block time and circle_id
-    if matches!(circle.payout_order_type, PayoutOrderType::RandomOrder) {
-        let mut members = circle.members_list.clone();
-        // Simple deterministic shuffle using block time as seed
-        // This is not cryptographically secure but works for demo purposes
-        let seed = env.block.time.seconds() + circle_id as u64;
-        for i in 0..members.len() {
-            let j = (seed as usize + i * 7) % members.len();
-            members.swap(i, j);
+    // Generate payout order if needed
+    if circle.payout_order_list.is_none() {
+        match circle.payout_order_type {
+            PayoutOrderType::RandomOrder => {
+                // Generate random order
+                // Note: In production, use a proper random oracle or commit-reveal scheme
+                // For now, we'll use a deterministic shuffle based on block time and circle_id
+                let mut members = circle.members_list.clone();
+                let seed = env.block.time.seconds() + circle_id as u64;
+                for i in 0..members.len() {
+                    let j = (seed as usize + i * 7) % members.len();
+                    members.swap(i, j);
+                }
+                circle.payout_order_list = Some(members);
+            }
+            PayoutOrderType::PredefinedOrder => {
+                // FIFO: Use join order (members_list as-is)
+                circle.payout_order_list = Some(circle.members_list.clone());
+            }
         }
-        circle.payout_order_list = Some(members);
     }
 
     // Set start date if not set

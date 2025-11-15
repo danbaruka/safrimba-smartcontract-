@@ -155,7 +155,15 @@ pub struct MemberMissedPayments {
     pub last_missed_cycle: Option<u32>,
 }
 
+// Platform configuration stored at contract level
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+pub struct PlatformConfig {
+    pub platform_fee_percent: u64,
+    pub platform_address: Addr,
+}
+
 // Storage
+pub const PLATFORM_CONFIG: Item<PlatformConfig> = Item::new("platform_config");
 pub const CIRCLE_COUNTER: Item<u64> = Item::new("circle_counter");
 pub const CIRCLES: Map<u64, Circle> = Map::new("circles");
 pub const PAYOUTS: Map<(u64, u32), PayoutRecord> = Map::new("payouts");
