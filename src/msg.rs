@@ -31,6 +31,10 @@ pub enum ExecuteMsg {
         start_date: Option<Timestamp>,
         grace_period_hours: u32,
         auto_start_when_full: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        auto_start_type: Option<String>, // "by_members" or "by_date"
+        #[serde(skip_serializing_if = "Option::is_none")]
+        auto_start_date: Option<Timestamp>, // Date for auto-start if type is "by_date"
         payout_order_type: PayoutOrderType,
         #[serde(skip_serializing_if = "Option::is_none")]
         payout_order_list: Option<Vec<Addr>>,
@@ -47,8 +51,14 @@ pub enum ExecuteMsg {
         show_member_identities: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         arbiter_fee_percent: Option<u64>,
+        creator_lock_amount: Uint128, // Minimum 200 SAF
+        #[serde(skip_serializing_if = "Option::is_none")]
+        first_distribution_threshold_percent: Option<u64>, // Max 60%
     },
     JoinCircle {
+        circle_id: u64,
+    },
+    LockJoinDeposit {
         circle_id: u64,
     },
     InviteMember {
@@ -91,6 +101,26 @@ pub enum ExecuteMsg {
     WithdrawPlatformFees {
         circle_id: Option<u64>, // If None, withdraw all
     },
+    // Private Circle and Member Management
+    AddPrivateMember {
+        circle_id: u64,
+        member_address: Addr,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pseudonym: Option<String>,
+    },
+    UpdateMemberPseudonym {
+        circle_id: u64,
+        member_address: Addr,
+        pseudonym: String,
+    },
+    BlockMember {
+        circle_id: u64,
+        member_address: Addr,
+    },
+    DistributeBlockedFunds {
+        circle_id: u64,
+        cycle: u32,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
@@ -128,6 +158,14 @@ pub enum QueryMsg {
     // Statistics
     GetCircleStats { circle_id: u64 },
     GetMemberStats { circle_id: u64, member: Addr },
+    
+    // Locking and Private Circle Queries
+    GetMemberLockedAmount { circle_id: u64, member: Addr },
+    GetBlockedMembers { circle_id: u64 },
+    GetMemberPseudonym { circle_id: u64, member: Addr },
+    GetPrivateMembers { circle_id: u64 },
+    GetDistributionCalendar { circle_id: u64 },
+    GetArchivedDate { circle_id: u64 },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
@@ -210,5 +248,44 @@ pub struct MemberStatsResponse {
     pub total_received: Uint128,
     pub total_penalties: Uint128,
     pub missed_payments: u32,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+pub struct MemberLockedAmountResponse {
+    pub amount: Uint128,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+pub struct BlockedMembersResponse {
+    pub blocked_members: Vec<(Addr, u32)>, // (member_address, blocked_from_cycle)
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+pub struct MemberPseudonymResponse {
+    pub pseudonym: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+pub struct PrivateMembersResponse {
+    pub members: Vec<Addr>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+pub struct DistributionCalendarResponse {
+    pub rounds: Vec<CalendarRound>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+pub struct CalendarRound {
+    pub round_number: u32,
+    pub cycle_number: u32,
+    pub deposit_deadline: Timestamp,
+    pub distribution_date: Timestamp,
+    pub recipient: Option<Addr>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+pub struct ArchivedDateResponse {
+    pub archived_date: Option<Timestamp>,
 }
 

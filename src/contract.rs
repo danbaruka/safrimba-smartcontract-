@@ -7,7 +7,9 @@ use crate::query::{
     query_circle, query_circle_balance, query_circle_members, query_circle_stats,
     query_circle_status, query_current_cycle, query_cycle_deposits, query_events,
     query_member_balance, query_member_deposits, query_member_stats, query_payout_history,
-    query_payouts, query_penalties, query_refunds, query_circles,
+    query_payouts, query_penalties, query_refunds, query_circles, query_member_locked_amount,
+    query_blocked_members, query_member_pseudonym, query_private_members,
+    query_distribution_calendar, query_archived_date,
 };
 use crate::state::PlatformConfig;
 
@@ -104,6 +106,24 @@ pub fn query(deps: Deps, env: Env, msg: QueryMsg) -> StdResult<Binary> {
         }
         QueryMsg::GetMemberStats { circle_id, member } => {
             cosmwasm_std::to_json_binary(&query_member_stats(deps, env, circle_id, member)?)
+        }
+        QueryMsg::GetMemberLockedAmount { circle_id, member } => {
+            cosmwasm_std::to_json_binary(&query_member_locked_amount(deps, env, circle_id, member)?)
+        }
+        QueryMsg::GetBlockedMembers { circle_id } => {
+            cosmwasm_std::to_json_binary(&query_blocked_members(deps, env, circle_id)?)
+        }
+        QueryMsg::GetMemberPseudonym { circle_id, member } => {
+            cosmwasm_std::to_json_binary(&query_member_pseudonym(deps, env, circle_id, member)?)
+        }
+        QueryMsg::GetPrivateMembers { circle_id } => {
+            cosmwasm_std::to_json_binary(&query_private_members(deps, env, circle_id)?)
+        }
+        QueryMsg::GetDistributionCalendar { circle_id } => {
+            cosmwasm_std::to_json_binary(&query_distribution_calendar(deps, env, circle_id)?)
+        }
+        QueryMsg::GetArchivedDate { circle_id } => {
+            cosmwasm_std::to_json_binary(&query_archived_date(deps, env, circle_id)?)
         }
     }
 }

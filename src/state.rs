@@ -40,6 +40,10 @@ pub struct Circle {
     pub end_date: Option<Timestamp>,
     pub grace_period_hours: u32,
     pub auto_start_when_full: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_start_type: Option<String>, // "by_members" or "by_date"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_start_date: Option<Timestamp>, // Date for auto-start if type is "by_date"
 
     // Payout Logic Parameters
     pub payout_order_type: PayoutOrderType,
@@ -62,6 +66,11 @@ pub struct Circle {
     pub total_platform_fees_collected: Uint128,
     pub withdrawal_lock: bool,
     pub refund_mode: RefundMode,
+    
+    // Locking and Security Features
+    pub creator_lock_amount: Uint128, // Locked by creator (200 SAF minimum)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_distribution_threshold_percent: Option<u64>, // % required before first distribution (max 60)
 
     // Internal State Parameters
     pub circle_status: CircleStatus,
@@ -173,4 +182,10 @@ pub const REFUNDS: Map<(u64, Addr), RefundRecord> = Map::new("refunds");
 pub const EVENTS: Map<(u64, u64), EventLog> = Map::new("events");
 pub const MEMBER_MISSED_PAYMENTS: Map<(u64, Addr), MemberMissedPayments> = Map::new("missed_payments");
 pub const EVENT_COUNTER: Map<u64, u64> = Map::new("event_counter");
+
+// Locking and Private Circle Storage
+pub const MEMBER_LOCKED_AMOUNTS: Map<(u64, Addr), Uint128> = Map::new("member_locked_amounts"); // Join deposits per member per circle
+pub const BLOCKED_MEMBERS: Map<(u64, Addr), u32> = Map::new("blocked_members"); // Track which cycle member was blocked
+pub const MEMBER_PSEUDONYMS: Map<(u64, Addr), String> = Map::new("member_pseudonyms"); // Pseudonyms for private circles
+pub const PRIVATE_MEMBER_LIST: Map<u64, Vec<Addr>> = Map::new("private_member_list"); // Explicitly added members for private circles
 

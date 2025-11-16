@@ -1,13 +1,16 @@
-use cosmwasm_std::{Addr, Deps, Env, Order, StdResult, Uint128};
+use cosmwasm_std::{Addr, Deps, Env, Order, StdResult, Uint128, Timestamp};
 use cw_storage_plus::Bound;
 
 use crate::msg::{
     BalanceResponse, CircleResponse, CirclesResponse, CycleResponse, DepositsResponse,
     EventsResponse, MemberStatsResponse, MembersResponse, PayoutsResponse, PenaltiesResponse,
-    RefundsResponse, StatusResponse, CircleStatsResponse,
+    RefundsResponse, StatusResponse, CircleStatsResponse, MemberLockedAmountResponse,
+    BlockedMembersResponse, MemberPseudonymResponse, PrivateMembersResponse,
+    DistributionCalendarResponse, ArchivedDateResponse, CalendarRound,
 };
 use crate::state::{
     Circle, CircleStatus, CIRCLES, DEPOSITS, EVENTS, EVENT_COUNTER, PAYOUTS, PENALTIES, REFUNDS,
+    MEMBER_LOCKED_AMOUNTS, BLOCKED_MEMBERS, MEMBER_PSEUDONYMS, PRIVATE_MEMBER_LIST,
 };
 
 pub fn query_circle(deps: Deps, _env: Env, circle_id: u64) -> StdResult<CircleResponse> {
@@ -344,6 +347,134 @@ pub fn query_member_stats(
         total_received,
         total_penalties,
         missed_payments,
+    })
+}
+
+pub fn query_member_locked_amount(
+    deps: Deps,
+    _env: Env,
+    circle_id: u64,
+    member: Addr,
+) -> StdResult<MemberLockedAmountResponse> {
+    let locked_amount = MEMBER_LOCKED_AMOUNTS
+        .may_load(deps.storage, (circle_id, member))?
+        .unwrap_or(Uint128::zero());
+    
+    Ok(MemberLockedAmountResponse {
+        amount: locked_amount,
+    })
+}
+
+pub fn query_blocked_members(
+    deps: Deps,
+    _env: Env,
+    circle_id: u64,
+) -> StdResult<BlockedMembersResponse> {
+    let circle = CIRCLES.load(deps.storage, circle_id)?;
+    let mut blocked_members = vec![];
+    
+    for member in &circle.members_list {
+        if let Ok(Some(blocked_from_cycle)) = BLOCKED_MEMBERS.may_load(deps.storage, (circle_id, member.clone())) {
+            blocked_members.push((member.clone(), blocked_from_cycle));
+        }
+    }
+    
+    Ok(BlockedMembersResponse {
+        blocked_members,
+    })
+}
+
+pub fn query_member_pseudonym(
+    deps: Deps,
+    _env: Env,
+    circle_id: u64,
+    member: Addr,
+) -> StdResult<MemberPseudonymResponse> {
+    let pseudonym = MEMBER_PSEUDONYMS
+        .may_load(deps.storage, (circle_id, member))?
+        .map(Some)
+        .unwrap_or(None);
+    
+    Ok(MemberPseudonymResponse {
+        pseudonym,
+    })
+}
+
+pub fn query_private_members(
+    deps: Deps,
+    _env: Env,
+    circle_id: u64,
+) -> StdResult<PrivateMembersResponse> {
+    let members = PRIVATE_MEMBER_LIST
+        .may_load(deps.storage, circle_id)?
+        .unwrap_or_default();
+    
+    Ok(PrivateMembersResponse {
+        members,
+    })
+}
+
+pub fn query_distribution_calendar(
+    deps: Deps,
+    _env: Env,
+    circle_id: u64,
+) -> StdResult<DistributionCalendarResponse> {
+    let circle = CIRCLES.load(deps.storage, circle_id)?;
+    
+    let start_timestamp = circle.start_date.ok_or_else(|| {
+        cosmwasm_std::StdError::generic_err("Circle has not started yet")
+    })?;
+    
+    let mut rounds = vec![];
+    
+    if let Some(payout_order) = &circle.payout_order_list {
+        let mut round_number = 1u32;
+        for cycle in 1..=circle.total_cycles {
+            for recipient in payout_order.iter() {
+                // Calculate dates for this round
+                let round_offset_seconds = ((round_number - 1) * circle.cycle_duration_days as u32) * 86400;
+                let deposit_deadline = Timestamp::from_seconds(
+                    start_timestamp.seconds() + round_offset_seconds as u64
+                );
+                let distribution_date = Timestamp::from_seconds(
+                    start_timestamp.seconds() + round_offset_seconds as u64 + (circle.cycle_duration_days as u64 * 86400)
+                );
+                
+                rounds.push(CalendarRound {
+                    round_number,
+                    cycle_number: cycle,
+                    deposit_deadline,
+                    distribution_date,
+                    recipient: Some(recipient.clone()),
+                });
+                
+                round_number += 1;
+            }
+        }
+    }
+    
+    Ok(DistributionCalendarResponse {
+        rounds,
+    })
+}
+
+pub fn query_archived_date(
+    deps: Deps,
+    _env: Env,
+    circle_id: u64,
+) -> StdResult<ArchivedDateResponse> {
+    let circle = CIRCLES.load(deps.storage, circle_id)?;
+    
+    let archived_date = if let (Some(end_date), grace_period_hours) = (circle.end_date, circle.grace_period_hours) {
+        Some(Timestamp::from_seconds(
+            end_date.seconds() + (grace_period_hours as u64 * 3600)
+        ))
+    } else {
+        None
+    };
+    
+    Ok(ArchivedDateResponse {
+        archived_date,
     })
 }
 
