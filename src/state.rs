@@ -68,7 +68,7 @@ pub struct Circle {
     pub refund_mode: RefundMode,
     
     // Locking and Security Features
-    pub creator_lock_amount: Uint128, // Locked by creator (200 SAF minimum)
+    pub creator_lock_amount: Uint128, // Locked by creator (10 SAF minimum)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub first_distribution_threshold_percent: Option<u64>, // % required before first distribution (max 60)
 

@@ -210,11 +210,11 @@ fn execute_create_circle(
         });
     }
     
-    // Validate creator_lock_amount: minimum 200 SAF (200000000 usaf with 6 decimals)
-    const MIN_CREATOR_LOCK: Uint128 = Uint128::new(50_000_000u128); // 200 SAF
+    // Validate creator_lock_amount: minimum 10 SAF (10000000 usaf with 6 decimals)
+    const MIN_CREATOR_LOCK: Uint128 = Uint128::new(10_000_000u128); // 10 SAF
     if creator_lock_amount < MIN_CREATOR_LOCK {
         return Err(ContractError::InvalidParameters {
-            msg: format!("creator_lock_amount must be at least 200 SAF ({} usaf)", MIN_CREATOR_LOCK),
+            msg: format!("creator_lock_amount must be at least 10 SAF ({} usaf)", MIN_CREATOR_LOCK),
         });
     }
     

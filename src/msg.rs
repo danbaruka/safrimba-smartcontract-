@@ -51,7 +51,7 @@ pub enum ExecuteMsg {
         show_member_identities: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         arbiter_fee_percent: Option<u64>,
-        creator_lock_amount: Uint128, // Minimum 200 SAF
+        creator_lock_amount: Uint128, // Minimum 10 SAF
         #[serde(skip_serializing_if = "Option::is_none")]
         first_distribution_threshold_percent: Option<u64>, // Max 60%
     },
