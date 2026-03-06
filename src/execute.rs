@@ -208,6 +208,12 @@ fn compute_max_missed_scaled(
     scaled.max(1)
 }
 
+/// Cap max_missed so ejection happens before the last round. max_missed <= total_rounds - 1.
+fn cap_max_missed_by_rounds(max_missed: u32, total_rounds: u32) -> u32 {
+    let cap = total_rounds.saturating_sub(1).max(1);
+    max_missed.min(cap)
+}
+
 /// Legacy alias for compute_max_missed_base (used at CreateCircle for preview).
 fn compute_max_missed(exit_penalty_percent: u64, late_fee_percent: u64) -> u32 {
     compute_max_missed_base(exit_penalty_percent, late_fee_percent)
@@ -281,11 +287,15 @@ fn eject_member_from_circle(
     MEMBER_MISSED_PAYMENTS.save(deps.storage, (circle.circle_id, member.clone()), &missed)?;
 
     // Recompute max_missed_payments_allowed (dynamic from % penalty and late fee, scaled by active members)
-    circle.max_missed_payments_allowed = compute_max_missed_scaled(
-        circle.exit_penalty_percent,
-        circle.late_fee_percent,
-        circle.members_at_start,
-        circle.members_list.len() as u32,
+    let total_rounds = circle.max_members * circle.total_cycles;
+    circle.max_missed_payments_allowed = cap_max_missed_by_rounds(
+        compute_max_missed_scaled(
+            circle.exit_penalty_percent,
+            circle.late_fee_percent,
+            circle.members_at_start,
+            circle.members_list.len() as u32,
+        ),
+        total_rounds,
     );
 
     log_event(
@@ -424,8 +434,12 @@ fn execute_create_circle(
         });
     }
 
-    // Auto-calculate max_missed_payments_allowed
-    let max_missed = compute_max_missed(exit_penalty_percent, late_fee_percent);
+    // Auto-calculate max_missed_payments_allowed; cap at total_rounds-1 so ejection happens before last round
+    let total_rounds = max_members * total_cycles;
+    let max_missed = cap_max_missed_by_rounds(
+        compute_max_missed(exit_penalty_percent, late_fee_percent),
+        total_rounds,
+    );
 
     let circle_id = CIRCLE_COUNTER
         .may_load(deps.storage)?
@@ -899,11 +913,15 @@ fn execute_exit_circle(
         circle.updated_at = env.block.time;
 
         // Recompute max_missed_payments_allowed (dynamic from % penalty and late fee, scaled by active members)
-        circle.max_missed_payments_allowed = compute_max_missed_scaled(
-            circle.exit_penalty_percent,
-            circle.late_fee_percent,
-            circle.members_at_start,
-            circle.members_list.len() as u32,
+        let total_rounds = circle.max_members * circle.total_cycles;
+        circle.max_missed_payments_allowed = cap_max_missed_by_rounds(
+            compute_max_missed_scaled(
+                circle.exit_penalty_percent,
+                circle.late_fee_percent,
+                circle.members_at_start,
+                circle.members_list.len() as u32,
+            ),
+            total_rounds,
         );
 
         // Remove from payout order for future rounds
@@ -1052,11 +1070,14 @@ fn execute_start_circle(
     // Set fee params at start: members_at_start and max_missed (dynamically from % penalty and late fee)
     let members_at_start = circle.members_list.len() as u32;
     circle.members_at_start = Some(members_at_start);
-    circle.max_missed_payments_allowed = compute_max_missed_scaled(
-        circle.exit_penalty_percent,
-        circle.late_fee_percent,
-        Some(members_at_start),
-        members_at_start,
+    circle.max_missed_payments_allowed = cap_max_missed_by_rounds(
+        compute_max_missed_scaled(
+            circle.exit_penalty_percent,
+            circle.late_fee_percent,
+            Some(members_at_start),
+            members_at_start,
+        ),
+        total_rounds,
     );
 
     CIRCLES.save(deps.storage, circle_id, &circle)?;
