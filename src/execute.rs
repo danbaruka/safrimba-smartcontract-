@@ -1,17 +1,18 @@
 use cosmwasm_std::{
-    Addr, BankMsg, Coin, DepsMut, Env, MessageInfo, Order, Response, StdResult, Storage, Timestamp,
-    Uint128,
+    Addr, BankMsg, Coin, CosmosMsg, DepsMut, DistributionMsg, Env, MessageInfo, Order, Response,
+    StdResult, StakingMsg, Storage, Timestamp, Uint128,
 };
 use cw_utils::must_pay;
 
 use crate::error::ContractError;
 use crate::msg::ExecuteMsg;
 use crate::state::{
-    Circle, CircleStatus, DepositRecord, DistributionThreshold, EventLog, MemberMissedPayments,
-    PayoutOrderType, PayoutRecord, PenaltyRecord, RefundMode, Visibility, BLOCKED_MEMBERS,
-    CIRCLE_COUNTER, CIRCLES, DEPOSITS, EVENTS, EVENT_COUNTER, MEMBER_ACCUMULATED_LATE_FEES,
-    MEMBER_LOCKED_AMOUNTS, MEMBER_MISSED_PAYMENTS, MEMBER_PSEUDONYMS, PAYOUTS, PENALTIES,
-    PENDING_PAYOUTS, PLATFORM_CONFIG, PRIVATE_MEMBER_LIST,
+    Circle, CircleStakingConfig, CircleStatus, DepositRecord, DistributionThreshold, EventLog,
+    MemberMissedPayments, PayoutOrderType, PayoutRecord, PendingRefundRecord, PendingUndelegation,
+    PenaltyRecord, RefundMode, Visibility, BLOCKED_MEMBERS, CIRCLE_COUNTER, CIRCLES, CIRCLE_STAKING,
+    DEPOSITS, EVENTS, EVENT_COUNTER, MEMBER_ACCUMULATED_LATE_FEES, MEMBER_LOCKED_AMOUNTS,
+    MEMBER_MISSED_PAYMENTS, MEMBER_PSEUDONYMS, PAYOUTS, PENALTIES, PENDING_PAYOUTS, PENDING_REFUNDS,
+    PLATFORM_CONFIG, PRIVATE_MEMBER_LIST,
 };
 
 pub fn execute(
@@ -141,6 +142,16 @@ pub fn execute(
         ExecuteMsg::DistributeBlockedFunds { circle_id, cycle } => {
             execute_distribute_blocked_funds(deps, env, info, circle_id, cycle)
         }
+        ExecuteMsg::EnableStaking {
+            circle_id,
+            validator_address,
+        } => execute_enable_staking(deps, env, info, circle_id, validator_address),
+        ExecuteMsg::DisableStaking { circle_id } => {
+            execute_disable_staking(deps, env, info, circle_id)
+        }
+        ExecuteMsg::ClaimPendingRefund { circle_id } => {
+            execute_claim_pending_refund(deps, env, info, circle_id)
+        }
     }
 }
 
@@ -168,14 +179,38 @@ fn compute_exit_penalty(locked: Uint128, exit_penalty_percent: u64) -> Uint128 {
     locked.multiply_ratio(exit_penalty_percent, 10000u64)
 }
 
-/// Auto-calculate max_missed_payments_allowed: floor((10000 - exit_penalty_percent) / late_fee_percent)
-/// Returns 0 if late_fee_percent is 0 (no late fees configured).
-fn compute_max_missed(exit_penalty_percent: u64, late_fee_percent: u64) -> u32 {
+/// Base max_missed: floor((10000 - exit_penalty_percent) / late_fee_percent) from % penalty and late fee.
+/// Returns u32::MAX if late_fee_percent is 0 (no late fees configured).
+fn compute_max_missed_base(exit_penalty_percent: u64, late_fee_percent: u64) -> u32 {
     if late_fee_percent == 0 {
         return u32::MAX;
     }
     let numerator = 10000u64.saturating_sub(exit_penalty_percent);
     (numerator / late_fee_percent) as u32
+}
+
+/// Compute max_missed scaled by active members. When members_at_start is None, returns base.
+fn compute_max_missed_scaled(
+    exit_penalty_percent: u64,
+    late_fee_percent: u64,
+    members_at_start: Option<u32>,
+    current_active_members: u32,
+) -> u32 {
+    let base = compute_max_missed_base(exit_penalty_percent, late_fee_percent);
+    let Some(start_count) = members_at_start else {
+        return base;
+    };
+    if start_count == 0 {
+        return base;
+    }
+    // Scale: max_missed decreases (stricter) when members exit or are ejected
+    let scaled = (base as u64 * current_active_members as u64 / start_count as u64) as u32;
+    scaled.max(1)
+}
+
+/// Legacy alias for compute_max_missed_base (used at CreateCircle for preview).
+fn compute_max_missed(exit_penalty_percent: u64, late_fee_percent: u64) -> u32 {
+    compute_max_missed_base(exit_penalty_percent, late_fee_percent)
 }
 
 /// Check if member meets ejection condition: accumulated_late_fees + exit_penalty >= locked_amount.
@@ -244,6 +279,14 @@ fn eject_member_from_circle(
         });
     missed.last_missed_cycle = Some(circle.current_cycle_index);
     MEMBER_MISSED_PAYMENTS.save(deps.storage, (circle.circle_id, member.clone()), &missed)?;
+
+    // Recompute max_missed_payments_allowed (dynamic from % penalty and late fee, scaled by active members)
+    circle.max_missed_payments_allowed = compute_max_missed_scaled(
+        circle.exit_penalty_percent,
+        circle.late_fee_percent,
+        circle.members_at_start,
+        circle.members_list.len() as u32,
+    );
 
     log_event(
         deps,
@@ -470,6 +513,7 @@ fn execute_create_circle(
         show_member_identities,
         creator_lock_amount: required_creator_lock,
         distribution_threshold: effective_threshold,
+        members_at_start: None, // Set at StartCircle when member count is known
     };
 
     CIRCLES.save(deps.storage, circle_id, &circle)?;
@@ -616,11 +660,16 @@ fn execute_join_circle(
         &format!("Member {} joined circle {} (locked: {})", info.sender, circle_id, circle.contribution_amount),
     )?;
 
-    Ok(Response::new()
+    let staking_msgs = rebalance_staking(deps.branch(), &env, circle_id)?;
+    let mut resp = Response::new()
         .add_attribute("action", "join_circle")
         .add_attribute("circle_id", circle_id.to_string())
         .add_attribute("member", info.sender)
-        .add_attribute("locked_amount", circle.contribution_amount.to_string()))
+        .add_attribute("locked_amount", circle.contribution_amount.to_string());
+    for msg in staking_msgs {
+        resp = resp.add_message(msg);
+    }
+    Ok(resp)
 }
 
 // ---------------------------------------------------------------------------
@@ -704,7 +753,7 @@ fn execute_exit_circle(
         CircleStatus::Running | CircleStatus::Paused
     );
 
-    let mut messages: Vec<BankMsg> = vec![];
+    let mut messages: Vec<CosmosMsg> = vec![];
     let mut refund_amount = Uint128::zero();
 
     if !started {
@@ -720,13 +769,15 @@ fn execute_exit_circle(
                 .unwrap_or(circle.total_amount_locked);
 
             if !refund_amount.is_zero() {
-                messages.push(BankMsg::Send {
-                    to_address: info.sender.to_string(),
-                    amount: vec![Coin {
-                        denom: circle.denomination.clone(),
-                        amount: refund_amount,
-                    }],
-                });
+                let (refund_msgs, _) = safe_refund_or_queue(
+                    deps.branch(),
+                    &env,
+                    circle_id,
+                    &info.sender,
+                    refund_amount,
+                    &circle.denomination,
+                )?;
+                messages.extend(refund_msgs);
             }
         }
 
@@ -752,13 +803,15 @@ fn execute_exit_circle(
             let mut extra_refund_total = Uint128::zero();
             for (member, amount) in locked_entries {
                 if !amount.is_zero() {
-                    messages.push(BankMsg::Send {
-                        to_address: member.to_string(),
-                        amount: vec![Coin {
-                            denom: circle.denomination.clone(),
-                            amount,
-                        }],
-                    });
+                    let (refund_msgs, _) = safe_refund_or_queue(
+                        deps.branch(),
+                        &env,
+                        circle_id,
+                        &member,
+                        amount,
+                        &circle.denomination,
+                    )?;
+                    messages.extend(refund_msgs);
                     extra_refund_total += amount;
                 }
                 MEMBER_LOCKED_AMOUNTS.remove(deps.storage, (circle_id, member));
@@ -770,13 +823,16 @@ fn execute_exit_circle(
                     .unwrap_or(Uint128::zero());
             }
             if !circle.creator_lock_amount.is_zero() {
-                messages.push(BankMsg::Send {
-                    to_address: circle.creator_address.to_string(),
-                    amount: vec![Coin {
-                        denom: circle.denomination.clone(),
-                        amount: circle.creator_lock_amount,
-                    }],
-                });
+                let creator_amount = circle.creator_lock_amount;
+                let (refund_msgs, _) = safe_refund_or_queue(
+                    deps.branch(),
+                    &env,
+                    circle_id,
+                    &circle.creator_address,
+                    creator_amount,
+                    &circle.denomination,
+                )?;
+                messages.extend(refund_msgs);
             }
         }
 
@@ -821,13 +877,15 @@ fn execute_exit_circle(
                 .total_amount_locked
                 .checked_sub(refund)
                 .unwrap_or(circle.total_amount_locked);
-            messages.push(BankMsg::Send {
-                to_address: info.sender.to_string(),
-                amount: vec![Coin {
-                    denom: circle.denomination.clone(),
-                    amount: refund,
-                }],
-            });
+            let (refund_msgs, _) = safe_refund_or_queue(
+                deps.branch(),
+                &env,
+                circle_id,
+                &info.sender,
+                refund,
+                &circle.denomination,
+            )?;
+            messages.extend(refund_msgs);
         }
 
         refund_amount = refund;
@@ -840,6 +898,14 @@ fn execute_exit_circle(
         circle.members_list.retain(|m| m != &info.sender);
         circle.updated_at = env.block.time;
 
+        // Recompute max_missed_payments_allowed (dynamic from % penalty and late fee, scaled by active members)
+        circle.max_missed_payments_allowed = compute_max_missed_scaled(
+            circle.exit_penalty_percent,
+            circle.late_fee_percent,
+            circle.members_at_start,
+            circle.members_list.len() as u32,
+        );
+
         // Remove from payout order for future rounds
         if let Some(ref mut order) = circle.payout_order_list {
             order.retain(|m| m != &info.sender);
@@ -850,9 +916,62 @@ fn execute_exit_circle(
             .contribution_amount
             .checked_mul(Uint128::from(circle.members_list.len() as u128))
             .unwrap_or(circle.payout_amount);
+
+        // Creator exit: forfeit creator_lock_amount to remaining active members
+        if info.sender == circle.creator_address && !circle.creator_lock_amount.is_zero() {
+            let active: Vec<Addr> = circle
+                .members_list
+                .iter()
+                .filter(|m| *m != &circle.creator_address)
+                .filter(|m| {
+                    BLOCKED_MEMBERS
+                        .may_load(deps.storage, (circle_id, (*m).clone()))
+                        .unwrap_or(None)
+                        .map(|bc| bc > circle.current_cycle_index)
+                        .unwrap_or(true)
+                })
+                .cloned()
+                .collect();
+
+            if !active.is_empty() {
+                let count = Uint128::from(active.len() as u128);
+                let per_member = circle.creator_lock_amount.multiply_ratio(1u128, count.u128());
+                let remainder = circle
+                    .creator_lock_amount
+                    .checked_sub(per_member * count)
+                    .unwrap_or(Uint128::zero());
+
+                for (idx, member) in active.iter().enumerate() {
+                    let mut share = per_member;
+                    if idx == 0 {
+                        share = share.checked_add(remainder).unwrap_or(share);
+                    }
+                    if !share.is_zero() {
+                        let ep = PENDING_PAYOUTS
+                            .may_load(deps.storage, (circle_id, member.clone()))?
+                            .unwrap_or(Uint128::zero());
+                        PENDING_PAYOUTS.save(
+                            deps.storage,
+                            (circle_id, member.clone()),
+                            &(ep + share),
+                        )?;
+                    }
+                }
+                circle.total_pending_payouts = circle
+                    .total_pending_payouts
+                    .checked_add(circle.creator_lock_amount)
+                    .unwrap_or(circle.total_pending_payouts);
+            }
+            circle.creator_lock_amount = Uint128::zero();
+        }
     }
 
     CIRCLES.save(deps.storage, circle_id, &circle)?;
+
+    let staking_msgs = rebalance_staking(deps.branch(), &env, circle_id)?;
+    for msg in &staking_msgs {
+        messages.push(msg.clone());
+    }
 
     log_event(
         &mut deps,
@@ -865,12 +984,13 @@ fn execute_exit_circle(
         ),
     )?;
 
-    Ok(Response::new()
+    let resp = Response::new()
         .add_messages(messages)
         .add_attribute("action", "exit_circle")
         .add_attribute("circle_id", circle_id.to_string())
         .add_attribute("member", info.sender)
-        .add_attribute("refund_amount", refund_amount.to_string()))
+        .add_attribute("refund_amount", refund_amount.to_string());
+    Ok(resp)
 }
 
 // ---------------------------------------------------------------------------
@@ -928,6 +1048,16 @@ fn execute_start_circle(
     circle.circle_status = CircleStatus::Running;
     circle.current_cycle_index = 1;
     circle.updated_at = env.block.time;
+
+    // Set fee params at start: members_at_start and max_missed (dynamically from % penalty and late fee)
+    let members_at_start = circle.members_list.len() as u32;
+    circle.members_at_start = Some(members_at_start);
+    circle.max_missed_payments_allowed = compute_max_missed_scaled(
+        circle.exit_penalty_percent,
+        circle.late_fee_percent,
+        Some(members_at_start),
+        members_at_start,
+    );
 
     CIRCLES.save(deps.storage, circle_id, &circle)?;
 
@@ -1148,13 +1278,18 @@ fn execute_deposit_contribution(
         ),
     )?;
 
-    Ok(Response::new()
+    let staking_msgs = rebalance_staking(deps.branch(), &env, circle_id)?;
+    let mut resp = Response::new()
         .add_attribute("action", "deposit_contribution")
         .add_attribute("circle_id", circle_id.to_string())
         .add_attribute("member", info.sender)
         .add_attribute("cycle", circle.current_cycle_index.to_string())
         .add_attribute("amount", circle.contribution_amount.to_string())
-        .add_attribute("on_time", (!is_late).to_string()))
+        .add_attribute("on_time", (!is_late).to_string());
+    for msg in staking_msgs {
+        resp = resp.add_message(msg);
+    }
+    Ok(resp)
 }
 
 // ---------------------------------------------------------------------------
@@ -1467,11 +1602,18 @@ fn execute_process_payout(
     if circle.current_cycle_index >= total_rounds {
         circle.circle_status = CircleStatus::Completed;
 
-        // Final distribution: all remaining locked + penalties distributed equally to active members via PENDING_PAYOUTS
-        let remaining = circle
+        // Final distribution: all remaining locked + penalties + staking rewards distributed equally to active members via PENDING_PAYOUTS
+        let mut remaining = circle
             .total_amount_locked
             .checked_add(circle.total_penalties_collected)
             .unwrap_or(circle.total_amount_locked);
+        if let Some(mut staking_cfg) = CIRCLE_STAKING.may_load(deps.storage, circle_id)? {
+            remaining = remaining
+                .checked_add(staking_cfg.rewards_accumulated)
+                .unwrap_or(remaining);
+            staking_cfg.rewards_accumulated = Uint128::zero();
+            CIRCLE_STAKING.save(deps.storage, circle_id, &staking_cfg)?;
+        }
 
         if !remaining.is_zero() && !active_members.is_empty() {
             let member_count = Uint128::from(active_members.len() as u128);
@@ -1548,13 +1690,22 @@ fn execute_process_payout(
         ),
     )?;
 
-    Ok(Response::new()
+    let claim_msgs = claim_staking_rewards(deps.branch(), &env, circle_id)?;
+    let rebalance_msgs = rebalance_staking(deps.branch(), &env, circle_id)?;
+    let mut resp = Response::new()
         .add_attribute("action", "process_payout")
         .add_attribute("circle_id", circle_id.to_string())
         .add_attribute("cycle", circle.cycles_completed.to_string())
         .add_attribute("recipient", recipient)
         .add_attribute("amount", payout_amount.to_string())
-        .add_attribute("pending_withdrawal", "true"))
+        .add_attribute("pending_withdrawal", "true");
+    for msg in claim_msgs {
+        resp = resp.add_message(msg);
+    }
+    for msg in rebalance_msgs {
+        resp = resp.add_message(msg);
+    }
+    Ok(resp)
 }
 
 // ---------------------------------------------------------------------------
@@ -1711,7 +1862,7 @@ fn execute_cancel_circle(
     circle.circle_status = CircleStatus::Cancelled;
     circle.updated_at = env.block.time;
 
-    let mut messages: Vec<BankMsg> = Vec::new();
+    let mut messages: Vec<CosmosMsg> = Vec::new();
 
     if is_running {
         // Creator forfeits creator_lock_amount — distributed to active members via PENDING_PAYOUTS
@@ -1780,13 +1931,15 @@ fn execute_cancel_circle(
                     .total_amount_locked
                     .checked_sub(refund)
                     .unwrap_or(Uint128::zero());
-                messages.push(BankMsg::Send {
-                    to_address: member.to_string(),
-                    amount: vec![Coin {
-                        denom: circle.denomination.clone(),
-                        amount: refund,
-                    }],
-                });
+                let (refund_msgs, _) = safe_refund_or_queue(
+                    deps.branch(),
+                    &env,
+                    circle_id,
+                    member,
+                    refund,
+                    &circle.denomination,
+                )?;
+                messages.extend(refund_msgs);
             }
 
             MEMBER_LOCKED_AMOUNTS.remove(deps.storage, (circle_id, member.clone()));
@@ -1803,13 +1956,15 @@ fn execute_cancel_circle(
         let mut join_refund_total = Uint128::zero();
         for (member, amount) in locked_entries {
             if !amount.is_zero() {
-                messages.push(BankMsg::Send {
-                    to_address: member.to_string(),
-                    amount: vec![Coin {
-                        denom: circle.denomination.clone(),
-                        amount,
-                    }],
-                });
+                let (refund_msgs, _) = safe_refund_or_queue(
+                    deps.branch(),
+                    &env,
+                    circle_id,
+                    &member,
+                    amount,
+                    &circle.denomination,
+                )?;
+                messages.extend(refund_msgs);
                 join_refund_total += amount;
             }
             MEMBER_LOCKED_AMOUNTS.remove(deps.storage, (circle_id, member));
@@ -1824,15 +1979,21 @@ fn execute_cancel_circle(
 
         // Refund creator lock
         if !circle.creator_lock_amount.is_zero() {
-            messages.push(BankMsg::Send {
-                to_address: circle.creator_address.to_string(),
-                amount: vec![Coin {
-                    denom: circle.denomination.clone(),
-                    amount: circle.creator_lock_amount,
-                }],
-            });
+            let creator_amount = circle.creator_lock_amount;
+            let (refund_msgs, _) = safe_refund_or_queue(
+                deps.branch(),
+                &env,
+                circle_id,
+                &circle.creator_address,
+                creator_amount,
+                &circle.denomination,
+            )?;
+            messages.extend(refund_msgs);
         }
     }
+
+    let staking_msgs = rebalance_staking(deps.branch(), &env, circle_id)?;
+    messages.extend(staking_msgs);
 
     CIRCLES.save(deps.storage, circle_id, &circle)?;
 
@@ -2284,6 +2445,439 @@ fn execute_distribute_blocked_funds(
         .add_attribute("circle_id", circle_id.to_string())
         .add_attribute("cycle", cycle.to_string())
         .add_attribute("total_distributed", total_blocked_funds.to_string()))
+}
+
+// ---------------------------------------------------------------------------
+// Staking
+// ---------------------------------------------------------------------------
+
+/// Unbonding period in seconds (21 days typical for Cosmos chains)
+const UNBONDING_PERIOD_SECS: u64 = 21 * 24 * 60 * 60;
+
+fn execute_enable_staking(
+    mut deps: DepsMut,
+    env: Env,
+    info: MessageInfo,
+    circle_id: u64,
+    validator_address: String,
+) -> Result<Response, ContractError> {
+    let circle = CIRCLES.load(deps.storage, circle_id)?;
+
+    if info.sender != circle.creator_address {
+        return Err(ContractError::Unauthorized {
+            msg: "Only creator can enable staking".to_string(),
+        });
+    }
+
+    if CIRCLE_STAKING.may_load(deps.storage, circle_id)?.is_some() {
+        return Err(ContractError::InvalidParameters {
+            msg: "Staking already configured for this circle".to_string(),
+        });
+    }
+
+    if !matches!(
+        circle.circle_status,
+        CircleStatus::Open | CircleStatus::Full | CircleStatus::Running
+    ) {
+        return Err(ContractError::InvalidCircleStatus {
+            expected: "Open, Full or Running".to_string(),
+            actual: format!("{:?}", circle.circle_status),
+        });
+    }
+
+    if validator_address.trim().is_empty() {
+        return Err(ContractError::InvalidParameters {
+            msg: "Validator address cannot be empty".to_string(),
+        });
+    }
+
+    let config = CircleStakingConfig {
+        enabled: true,
+        validator_address: validator_address.clone(),
+        staked_amount: Uint128::zero(),
+        total_rewards_earned: Uint128::zero(),
+        rewards_accumulated: Uint128::zero(),
+        last_claim_at: None,
+        pending_undelegations: vec![],
+    };
+    CIRCLE_STAKING.save(deps.storage, circle_id, &config)?;
+
+    log_event(
+        &mut deps,
+        &env,
+        circle_id,
+        "staking_enabled",
+        &format!("Staking enabled for circle {} with validator {}", circle_id, validator_address),
+    )?;
+
+    let staking_msgs = rebalance_staking(deps.branch(), &env, circle_id)?;
+    let mut resp = Response::new()
+        .add_attribute("action", "enable_staking")
+        .add_attribute("circle_id", circle_id.to_string())
+        .add_attribute("validator", validator_address);
+    for msg in staking_msgs {
+        resp = resp.add_message(msg);
+    }
+    Ok(resp)
+}
+
+fn execute_disable_staking(
+    mut deps: DepsMut,
+    env: Env,
+    info: MessageInfo,
+    circle_id: u64,
+) -> Result<Response, ContractError> {
+    let circle = CIRCLES.load(deps.storage, circle_id)?;
+
+    if info.sender != circle.creator_address {
+        return Err(ContractError::Unauthorized {
+            msg: "Only creator can disable staking".to_string(),
+        });
+    }
+
+    let Some(mut config) = CIRCLE_STAKING.may_load(deps.storage, circle_id)? else {
+        return Err(ContractError::InvalidParameters {
+            msg: "Staking not enabled for this circle".to_string(),
+        });
+    };
+
+    config.enabled = false;
+    CIRCLE_STAKING.save(deps.storage, circle_id, &config)?;
+
+    let mut messages: Vec<CosmosMsg> = vec![];
+
+    if !config.staked_amount.is_zero() {
+        messages.push(CosmosMsg::Staking(StakingMsg::Undelegate {
+            validator: config.validator_address.clone(),
+            amount: Coin {
+                denom: circle.denomination.clone(),
+                amount: config.staked_amount,
+            },
+        }));
+        config.pending_undelegations.push(PendingUndelegation {
+            amount: config.staked_amount,
+            available_at: Timestamp::from_seconds(
+                env.block.time.seconds() + UNBONDING_PERIOD_SECS,
+            ),
+            reason: "disable_staking".to_string(),
+        });
+        config.staked_amount = Uint128::zero();
+        CIRCLE_STAKING.save(deps.storage, circle_id, &config)?;
+    }
+
+    log_event(
+        &mut deps,
+        &env,
+        circle_id,
+        "staking_disabled",
+        &format!("Staking disabled for circle {}", circle_id),
+    )?;
+
+    Ok(Response::new()
+        .add_messages(messages)
+        .add_attribute("action", "disable_staking")
+        .add_attribute("circle_id", circle_id.to_string()))
+}
+
+fn execute_claim_pending_refund(
+    mut deps: DepsMut,
+    env: Env,
+    info: MessageInfo,
+    circle_id: u64,
+) -> Result<Response, ContractError> {
+    let circle = CIRCLES.load(deps.storage, circle_id)?;
+
+    let Some(record) = PENDING_REFUNDS.may_load(deps.storage, (circle_id, info.sender.clone()))? else {
+        return Err(ContractError::InvalidParameters {
+            msg: "No pending refund for this member".to_string(),
+        });
+    };
+
+    if record.member != info.sender {
+        return Err(ContractError::Unauthorized {
+            msg: "Not your pending refund".to_string(),
+        });
+    }
+
+    if env.block.time < record.available_at {
+        return Err(ContractError::InvalidParameters {
+            msg: format!(
+                "Refund available at {} (unbonding in progress)",
+                record.available_at.seconds()
+            ),
+        });
+    }
+
+    PENDING_REFUNDS.remove(deps.storage, (circle_id, info.sender.clone()));
+
+    log_event(
+        &mut deps,
+        &env,
+        circle_id,
+        "pending_refund_claimed",
+        &format!("Member {} claimed {} usaf", info.sender, record.amount),
+    )?;
+
+    Ok(Response::new()
+        .add_message(BankMsg::Send {
+            to_address: info.sender.to_string(),
+            amount: vec![Coin {
+                denom: circle.denomination,
+                amount: record.amount,
+            }],
+        })
+        .add_attribute("action", "claim_pending_refund")
+        .add_attribute("circle_id", circle_id.to_string())
+        .add_attribute("member", info.sender)
+        .add_attribute("amount", record.amount.to_string()))
+}
+
+/// Returns messages to rebalance staking. Call after lock/deposit/exit/cancel/payout.
+fn rebalance_staking(
+    deps: DepsMut,
+    env: &Env,
+    circle_id: u64,
+) -> Result<Vec<CosmosMsg>, ContractError> {
+    let Some(mut config) = CIRCLE_STAKING.may_load(deps.storage, circle_id)? else {
+        return Ok(vec![]);
+    };
+    if !config.enabled {
+        return Ok(vec![]);
+    }
+
+    let circle = CIRCLES.load(deps.storage, circle_id)?;
+
+    if !matches!(
+        circle.circle_status,
+        CircleStatus::Open | CircleStatus::Full | CircleStatus::Running
+    ) {
+        return Ok(vec![]);
+    }
+
+    let active_count = circle
+        .members_list
+        .iter()
+        .filter(|m| {
+            BLOCKED_MEMBERS
+                .may_load(deps.storage, (circle_id, (*m).clone()))
+                .unwrap_or(None)
+                .map(|bc| bc > circle.current_cycle_index)
+                .unwrap_or(true)
+        })
+        .count() as u32;
+
+    if active_count == 0 {
+        return Ok(vec![]);
+    }
+
+    let liquid_reserve = circle
+        .payout_amount
+        .checked_mul(Uint128::from(2u128))
+        .map_err(|_| ContractError::InvalidParameters {
+            msg: "Reserve overflow".to_string(),
+        })?;
+
+    let total_locked = circle.total_amount_locked;
+
+    let mut msgs: Vec<CosmosMsg> = vec![];
+
+    if total_locked > liquid_reserve {
+        let ideal_staked = total_locked
+            .checked_sub(liquid_reserve)
+            .map_err(|_| ContractError::InvalidParameters {
+                msg: "Stakeable underflow".to_string(),
+            })?;
+
+        if ideal_staked > config.staked_amount {
+            let to_stake = ideal_staked
+                .checked_sub(config.staked_amount)
+                .map_err(|_| ContractError::InvalidParameters {
+                    msg: "Stake amount underflow".to_string(),
+                })?;
+
+            if !to_stake.is_zero() {
+                let balance = deps
+                    .querier
+                    .query_balance(&env.contract.address, &circle.denomination)
+                    .map_err(|e| ContractError::InvalidParameters {
+                        msg: format!("Balance query failed: {}", e),
+                    })?;
+                let available = balance.amount;
+                let actual_stake = if to_stake > available {
+                    available
+                } else {
+                    to_stake
+                };
+
+                if !actual_stake.is_zero() {
+                    msgs.push(CosmosMsg::Staking(StakingMsg::Delegate {
+                        validator: config.validator_address.clone(),
+                        amount: Coin {
+                            denom: circle.denomination.clone(),
+                            amount: actual_stake,
+                        },
+                    }));
+                    config.staked_amount = config
+                        .staked_amount
+                        .checked_add(actual_stake)
+                        .map_err(|_| ContractError::InvalidParameters {
+                            msg: "Staked amount overflow".to_string(),
+                        })?;
+                    CIRCLE_STAKING.save(deps.storage, circle_id, &config)?;
+                }
+            }
+        } else if config.staked_amount > ideal_staked {
+            let to_undelegate = config
+                .staked_amount
+                .checked_sub(ideal_staked)
+                .map_err(|_| ContractError::InvalidParameters {
+                    msg: "Undelegate amount underflow".to_string(),
+                })?;
+
+            if !to_undelegate.is_zero() {
+                msgs.push(CosmosMsg::Staking(StakingMsg::Undelegate {
+                    validator: config.validator_address.clone(),
+                    amount: Coin {
+                        denom: circle.denomination.clone(),
+                        amount: to_undelegate,
+                    },
+                }));
+                config.staked_amount = ideal_staked;
+                config.pending_undelegations.push(PendingUndelegation {
+                    amount: to_undelegate,
+                    available_at: Timestamp::from_seconds(
+                        env.block.time.seconds() + UNBONDING_PERIOD_SECS,
+                    ),
+                    reason: "rebalance".to_string(),
+                });
+                CIRCLE_STAKING.save(deps.storage, circle_id, &config)?;
+            }
+        }
+    } else if !config.staked_amount.is_zero() {
+        msgs.push(CosmosMsg::Staking(StakingMsg::Undelegate {
+            validator: config.validator_address.clone(),
+            amount: Coin {
+                denom: circle.denomination.clone(),
+                amount: config.staked_amount,
+            },
+        }));
+        config.pending_undelegations.push(PendingUndelegation {
+            amount: config.staked_amount,
+            available_at: Timestamp::from_seconds(
+                env.block.time.seconds() + UNBONDING_PERIOD_SECS,
+            ),
+            reason: "below_reserve".to_string(),
+        });
+        config.staked_amount = Uint128::zero();
+        CIRCLE_STAKING.save(deps.storage, circle_id, &config)?;
+    }
+
+    Ok(msgs)
+}
+
+/// Returns messages to claim staking rewards. Rewards go to rewards_accumulated for end distribution.
+fn claim_staking_rewards(
+    deps: DepsMut,
+    _env: &Env,
+    circle_id: u64,
+) -> Result<Vec<CosmosMsg>, ContractError> {
+    let Some(config) = CIRCLE_STAKING.may_load(deps.storage, circle_id)? else {
+        return Ok(vec![]);
+    };
+    if !config.enabled || config.staked_amount.is_zero() {
+        return Ok(vec![]);
+    }
+
+    Ok(vec![CosmosMsg::Distribution(
+        DistributionMsg::WithdrawDelegatorReward {
+            validator: config.validator_address,
+        },
+    )])
+}
+
+/// Try immediate refund or queue. Returns (messages, was_immediate).
+fn safe_refund_or_queue(
+    deps: DepsMut,
+    env: &Env,
+    circle_id: u64,
+    member: &Addr,
+    amount: Uint128,
+    denom: &str,
+) -> Result<(Vec<CosmosMsg>, bool), ContractError> {
+    if amount.is_zero() {
+        return Ok((vec![], true));
+    }
+
+    let balance = deps
+        .querier
+        .query_balance(&env.contract.address, denom)
+        .map_err(|e| ContractError::InvalidParameters {
+            msg: format!("Balance query failed: {}", e),
+        })?;
+
+    if balance.amount >= amount {
+        return Ok((
+            vec![CosmosMsg::Bank(BankMsg::Send {
+                to_address: member.to_string(),
+                amount: vec![Coin {
+                    denom: denom.to_string(),
+                    amount,
+                }],
+            })],
+            true,
+        ));
+    }
+
+    let Some(mut config) = CIRCLE_STAKING.may_load(deps.storage, circle_id)? else {
+        return Err(ContractError::InvalidParameters {
+            msg: "Insufficient liquid balance and staking not enabled".to_string(),
+        });
+    };
+
+    if !config.enabled || config.staked_amount.is_zero() {
+        return Err(ContractError::InvalidParameters {
+            msg: "Insufficient liquid balance for refund".to_string(),
+        });
+    }
+
+    let validator = config.validator_address.clone();
+    let to_undelegate = amount.min(config.staked_amount);
+    let available_at =
+        Timestamp::from_seconds(env.block.time.seconds() + UNBONDING_PERIOD_SECS);
+
+    PENDING_REFUNDS.save(
+        deps.storage,
+        (circle_id, member.clone()),
+        &PendingRefundRecord {
+            member: member.clone(),
+            amount,
+            available_at,
+        },
+    )?;
+
+    config.staked_amount = config
+        .staked_amount
+        .checked_sub(to_undelegate)
+        .map_err(|_| ContractError::InvalidParameters {
+            msg: "Staked amount underflow".to_string(),
+        })?;
+    config.pending_undelegations.push(PendingUndelegation {
+        amount: to_undelegate,
+        available_at,
+        reason: "refund".to_string(),
+    });
+    CIRCLE_STAKING.save(deps.storage, circle_id, &config)?;
+
+    Ok((
+        vec![CosmosMsg::Staking(StakingMsg::Undelegate {
+            validator,
+            amount: Coin {
+                denom: denom.to_string(),
+                amount: to_undelegate,
+            },
+        })],
+        false,
+    ))
 }
 
 // ---------------------------------------------------------------------------

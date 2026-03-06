@@ -338,3 +338,19 @@ pub struct AccumulatedLateFeesResponse {
     /// Rounds remaining before ejection
     pub rounds_until_ejection: u32,
 }
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+pub struct CircleStakingInfoResponse {
+    pub enabled: bool,
+    pub validator_address: Option<String>,
+    pub staked_amount: Uint128,
+    pub total_rewards_earned: Uint128,
+    pub rewards_accumulated: Uint128,
+    pub last_claim_at: Option<Timestamp>,
+    pub pending_undelegations: Vec<crate::state::PendingUndelegation>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+pub struct PendingRefundsResponse {
+    pub refunds: Vec<crate::state::PendingRefundRecord>,
+}

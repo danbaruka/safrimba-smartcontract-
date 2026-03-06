@@ -30,8 +30,12 @@ pub struct Circle {
     /// Late fee per missed round, in basis points of contribution_amount (e.g. 1000 = 10%). Accumulated against locked amount.
     pub late_fee_percent: u64,
     pub platform_fee_percent: u64, // Basis points (10000 = 100%)
-    /// Auto-calculated at creation: floor((10000 - exit_penalty_percent) / late_fee_percent)
+    /// Dynamically calculated from % penalty and late fee. Set at start, updated on exit/ejection.
+    /// Formula: floor((10000 - exit_penalty_percent) / late_fee_percent) * active_members / members_at_start
     pub max_missed_payments_allowed: u32,
+    /// Number of active members when circle started. Set at StartCircle, used to scale max_missed on exit/ejection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub members_at_start: Option<u32>,
 
     // Cycle & Time Parameters
     pub total_cycles: u32,

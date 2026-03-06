@@ -4,14 +4,16 @@ use cw_storage_plus::Bound;
 use crate::msg::{
     AccumulatedLateFeesResponse, BalanceResponse, CircleResponse, CirclesResponse, CycleResponse,
     DepositsResponse, EventsResponse, MemberStatsResponse, MembersResponse, PayoutsResponse,
-    PenaltiesResponse, PendingPayoutResponse, RefundsResponse, StatusResponse, CircleStatsResponse,
-    MemberLockedAmountResponse, BlockedMembersResponse, MemberPseudonymResponse,
-    PrivateMembersResponse, DistributionCalendarResponse, ArchivedDateResponse, CalendarRound,
+    PenaltiesResponse, PendingPayoutResponse, PendingRefundsResponse, RefundsResponse,
+    StatusResponse, CircleStatsResponse, CircleStakingInfoResponse, MemberLockedAmountResponse,
+    BlockedMembersResponse, MemberPseudonymResponse, PrivateMembersResponse,
+    DistributionCalendarResponse, ArchivedDateResponse, CalendarRound,
 };
 use crate::state::{
-    Circle, CircleStatus, CIRCLES, DEPOSITS, EVENTS, EVENT_COUNTER, PAYOUTS, PENALTIES, REFUNDS,
-    MEMBER_LOCKED_AMOUNTS, MEMBER_ACCUMULATED_LATE_FEES, MEMBER_MISSED_PAYMENTS, BLOCKED_MEMBERS,
-    MEMBER_PSEUDONYMS, PRIVATE_MEMBER_LIST, PENDING_PAYOUTS, DistributionThreshold,
+    Circle, CircleStatus, CIRCLES, CIRCLE_STAKING, DEPOSITS, EVENTS, EVENT_COUNTER, PAYOUTS,
+    PENALTIES, PENDING_REFUNDS, REFUNDS, MEMBER_LOCKED_AMOUNTS, MEMBER_ACCUMULATED_LATE_FEES,
+    MEMBER_MISSED_PAYMENTS, BLOCKED_MEMBERS, MEMBER_PSEUDONYMS, PRIVATE_MEMBER_LIST, PENDING_PAYOUTS,
+    DistributionThreshold,
 };
 
 pub fn query_circle(deps: Deps, _env: Env, circle_id: u64) -> StdResult<CircleResponse> {
@@ -556,5 +558,54 @@ pub fn query_archived_date(
     Ok(ArchivedDateResponse {
         archived_date,
     })
+}
+
+pub fn query_circle_staking_info(
+    deps: Deps,
+    _env: Env,
+    circle_id: u64,
+) -> StdResult<CircleStakingInfoResponse> {
+    let config = CIRCLE_STAKING.may_load(deps.storage, circle_id)?;
+    match config {
+        Some(cfg) => Ok(CircleStakingInfoResponse {
+            enabled: cfg.enabled,
+            validator_address: Some(cfg.validator_address),
+            staked_amount: cfg.staked_amount,
+            total_rewards_earned: cfg.total_rewards_earned,
+            rewards_accumulated: cfg.rewards_accumulated,
+            last_claim_at: cfg.last_claim_at,
+            pending_undelegations: cfg.pending_undelegations,
+        }),
+        None => Ok(CircleStakingInfoResponse {
+            enabled: false,
+            validator_address: None,
+            staked_amount: Uint128::zero(),
+            total_rewards_earned: Uint128::zero(),
+            rewards_accumulated: Uint128::zero(),
+            last_claim_at: None,
+            pending_undelegations: vec![],
+        }),
+    }
+}
+
+pub fn query_pending_refunds(
+    deps: Deps,
+    _env: Env,
+    circle_id: u64,
+    member: Option<Addr>,
+) -> StdResult<PendingRefundsResponse> {
+    let refunds: Vec<_> = if let Some(m) = member {
+        PENDING_REFUNDS
+            .may_load(deps.storage, (circle_id, m))?
+            .map(|r| vec![r])
+            .unwrap_or_default()
+    } else {
+        PENDING_REFUNDS
+            .prefix(circle_id)
+            .range(deps.storage, None, None, Order::Ascending)
+            .filter_map(|res| res.ok().map(|(_, r)| r))
+            .collect()
+    };
+    Ok(PendingRefundsResponse { refunds })
 }
 
