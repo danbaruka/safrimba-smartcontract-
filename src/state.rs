@@ -73,7 +73,7 @@ pub struct Circle {
     pub refund_mode: RefundMode,
 
     // Locking and Security Features
-    pub creator_lock_amount: Uint128, // = contribution_amount * (1 + max_members * 0.1)
+    pub creator_lock_amount: Uint128, // = contribution_amount * 2
     #[serde(skip_serializing_if = "Option::is_none")]
     pub distribution_threshold: Option<DistributionThreshold>,
 

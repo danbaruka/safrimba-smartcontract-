@@ -159,14 +159,13 @@ pub fn execute(
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Compute required creator lock: contribution * (1 + max_members * 10%) = contribution * (10000 + max_members * 1000) / 10000
-fn compute_creator_lock(contribution: Uint128, max_members: u32) -> Result<Uint128, ContractError> {
-    let numerator = contribution
-        .checked_mul(Uint128::from(10000u64 + max_members as u64 * 1000u64))
+/// Compute required creator lock: contribution_amount * 2
+fn compute_creator_lock(contribution: Uint128, _max_members: u32) -> Result<Uint128, ContractError> {
+    contribution
+        .checked_mul(Uint128::from(2u64))
         .map_err(|_| ContractError::InvalidParameters {
             msg: "Creator lock overflow".to_string(),
-        })?;
-    Ok(numerator.multiply_ratio(1u128, 10000u128))
+        })
 }
 
 /// Compute late fee per round: contribution * late_fee_percent / 10000
@@ -755,6 +754,13 @@ fn execute_exit_circle(
     circle_id: u64,
 ) -> Result<Response, ContractError> {
     let mut circle = CIRCLES.load(deps.storage, circle_id)?;
+
+    if circle.circle_status == CircleStatus::Cancelled {
+        return Err(ContractError::InvalidCircleStatus {
+            expected: "Draft, Open, Running or Paused".to_string(),
+            actual: "Cancelled".to_string(),
+        });
+    }
 
     if !circle.members_list.contains(&info.sender) {
         return Err(ContractError::Unauthorized {
@@ -2496,12 +2502,14 @@ fn execute_enable_staking(
         });
     }
 
+    // Allow enable_staking in Draft so creator can configure at creation.
+    // rebalance_staking returns empty for Draft, so actual delegation only starts when circle is Open/Full/Running.
     if !matches!(
         circle.circle_status,
-        CircleStatus::Open | CircleStatus::Full | CircleStatus::Running
+        CircleStatus::Draft | CircleStatus::Open | CircleStatus::Full | CircleStatus::Running
     ) {
         return Err(ContractError::InvalidCircleStatus {
-            expected: "Open, Full or Running".to_string(),
+            expected: "Draft, Open, Full or Running".to_string(),
             actual: format!("{:?}", circle.circle_status),
         });
     }
