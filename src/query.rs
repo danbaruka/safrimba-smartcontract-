@@ -2,15 +2,16 @@ use cosmwasm_std::{Addr, Deps, Env, Order, StdResult, Uint128, Timestamp};
 use cw_storage_plus::Bound;
 
 use crate::msg::{
-    BalanceResponse, CircleResponse, CirclesResponse, CycleResponse, DepositsResponse,
-    EventsResponse, MemberStatsResponse, MembersResponse, PayoutsResponse, PenaltiesResponse,
-    RefundsResponse, StatusResponse, CircleStatsResponse, MemberLockedAmountResponse,
-    BlockedMembersResponse, MemberPseudonymResponse, PrivateMembersResponse,
-    DistributionCalendarResponse, ArchivedDateResponse, CalendarRound,
+    AccumulatedLateFeesResponse, BalanceResponse, CircleResponse, CirclesResponse, CycleResponse,
+    DepositsResponse, EventsResponse, MemberStatsResponse, MembersResponse, PayoutsResponse,
+    PenaltiesResponse, PendingPayoutResponse, RefundsResponse, StatusResponse, CircleStatsResponse,
+    MemberLockedAmountResponse, BlockedMembersResponse, MemberPseudonymResponse,
+    PrivateMembersResponse, DistributionCalendarResponse, ArchivedDateResponse, CalendarRound,
 };
 use crate::state::{
     Circle, CircleStatus, CIRCLES, DEPOSITS, EVENTS, EVENT_COUNTER, PAYOUTS, PENALTIES, REFUNDS,
-    MEMBER_LOCKED_AMOUNTS, BLOCKED_MEMBERS, MEMBER_PSEUDONYMS, PRIVATE_MEMBER_LIST,
+    MEMBER_LOCKED_AMOUNTS, MEMBER_ACCUMULATED_LATE_FEES, MEMBER_MISSED_PAYMENTS, BLOCKED_MEMBERS,
+    MEMBER_PSEUDONYMS, PRIVATE_MEMBER_LIST, PENDING_PAYOUTS, DistributionThreshold,
 };
 
 pub fn query_circle(deps: Deps, _env: Env, circle_id: u64) -> StdResult<CircleResponse> {
@@ -290,6 +291,7 @@ pub fn query_circle_stats(deps: Deps, _env: Env, circle_id: u64) -> StdResult<Ci
         total_payouts,
         total_penalties: circle.total_penalties_collected,
         total_platform_fees: circle.total_platform_fees_collected,
+        total_pending_payouts: circle.total_pending_payouts,
     })
 }
 
@@ -340,13 +342,79 @@ pub fn query_member_stats(
         }
     }
 
+    let pending_payout = PENDING_PAYOUTS
+        .may_load(deps.storage, (circle_id, member.clone()))?
+        .unwrap_or(Uint128::zero());
+    let accumulated_late_fees = MEMBER_ACCUMULATED_LATE_FEES
+        .may_load(deps.storage, (circle_id, member.clone()))?
+        .unwrap_or(Uint128::zero());
+
     Ok(MemberStatsResponse {
         member,
-        circles_joined: 1, // This would need to be calculated across all circles
+        circles_joined: 1,
         total_contributed,
         total_received,
         total_penalties,
         missed_payments,
+        pending_payout,
+        accumulated_late_fees,
+    })
+}
+
+pub fn query_pending_payout(
+    deps: Deps,
+    _env: Env,
+    circle_id: u64,
+    member: Addr,
+) -> StdResult<PendingPayoutResponse> {
+    let amount = PENDING_PAYOUTS
+        .may_load(deps.storage, (circle_id, member))?
+        .unwrap_or(Uint128::zero());
+    Ok(PendingPayoutResponse { amount })
+}
+
+pub fn query_member_accumulated_late_fees(
+    deps: Deps,
+    _env: Env,
+    circle_id: u64,
+    member: Addr,
+) -> StdResult<AccumulatedLateFeesResponse> {
+    let circle = CIRCLES.load(deps.storage, circle_id)?;
+    let amount = MEMBER_ACCUMULATED_LATE_FEES
+        .may_load(deps.storage, (circle_id, member.clone()))?
+        .unwrap_or(Uint128::zero());
+    let locked_amount = MEMBER_LOCKED_AMOUNTS
+        .may_load(deps.storage, (circle_id, member.clone()))?
+        .unwrap_or(Uint128::zero());
+
+    let late_fee_per_round = circle
+        .contribution_amount
+        .multiply_ratio(circle.late_fee_percent, 10000u64);
+    let exit_penalty = locked_amount.multiply_ratio(circle.exit_penalty_percent, 10000u64);
+
+    let missed_info = MEMBER_MISSED_PAYMENTS
+        .may_load(deps.storage, (circle_id, member.clone()))?
+        .unwrap_or(crate::state::MemberMissedPayments {
+            member: member.clone(),
+            missed_count: 0,
+            last_missed_cycle: None,
+        });
+
+    let total_deduction_so_far = amount + exit_penalty;
+    let rounds_until_ejection = if total_deduction_so_far >= locked_amount || late_fee_per_round.is_zero() {
+        0
+    } else {
+        let remaining = locked_amount - total_deduction_so_far;
+        (remaining.u128() / late_fee_per_round.u128()) as u32
+    };
+
+    Ok(AccumulatedLateFeesResponse {
+        amount,
+        missed_rounds: missed_info.missed_count,
+        late_fee_per_round,
+        exit_penalty,
+        locked_amount,
+        rounds_until_ejection,
     })
 }
 
@@ -414,6 +482,8 @@ pub fn query_private_members(
     })
 }
 
+/// Returns the full calendar with `distribution_occurs` set per round:
+/// None => every round; Total => only last round of each cycle (100% of all members); MinMembers(N) => from round N to end of cycle.
 pub fn query_distribution_calendar(
     deps: Deps,
     _env: Env,
@@ -425,13 +495,22 @@ pub fn query_distribution_calendar(
         cosmwasm_std::StdError::generic_err("Circle has not started yet")
     })?;
     
+    // When the first distribution happens: None => round 1; Total => 100% of all members (last round only); MinMembers(N) => from round N to end of cycle.
+    let min_round_for_distribution: u32 = match circle.distribution_threshold {
+        None => 1,
+        Some(DistributionThreshold::Total) => circle.max_members,
+        Some(DistributionThreshold::MinMembers { count }) => count,
+    };
+    
     let mut rounds = vec![];
     
     if let Some(payout_order) = &circle.payout_order_list {
         let mut round_number = 1u32;
         for cycle in 1..=circle.total_cycles {
             for recipient in payout_order.iter() {
-                // Calculate dates for this round
+                let round_in_cycle = ((round_number - 1) % circle.max_members) + 1;
+                let distribution_occurs = round_in_cycle >= min_round_for_distribution;
+                
                 let round_offset_seconds = ((round_number - 1) * circle.cycle_duration_days as u32) * 86400;
                 let deposit_deadline = Timestamp::from_seconds(
                     start_timestamp.seconds() + round_offset_seconds as u64
@@ -445,6 +524,7 @@ pub fn query_distribution_calendar(
                     cycle_number: cycle,
                     deposit_deadline,
                     distribution_date,
+                    distribution_occurs,
                     recipient: Some(recipient.clone()),
                 });
                 
