@@ -1,0 +1,29 @@
+name: Issue
+description: Open an issue for the Safrimba smart contract
+title: "[Issue]: "
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to open an issue. Please choose a template below.
+  - type: dropdown
+    id: type
+    attributes:
+      label: Issue type
+      description: What kind of issue is this?
+      options:
+        - Bug report
+        - Feature request
+        - Documentation
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: Describe your issue clearly.
+      placeholder: Describe the issue...
+    validations:
+      required: true

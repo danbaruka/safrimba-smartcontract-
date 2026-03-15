@@ -1,6 +1,22 @@
 # Safrimba Smart Contract
 
+[![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
+[![CosmWasm](https://img.shields.io/badge/CosmWasm-1.5-blue.svg)](https://github.com/CosmWasm/cosmwasm)
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+
 A CosmWasm smart contract implementing a digital tontine system on Safrochain. The contract manages all deposits, rules, and payouts in SAF tokens automatically.
+
+## Table of contents
+
+- [Features](#features)
+- [Contract structure](#contract-structure)
+- [Documentation](#documentation)
+- [Building](#building)
+- [Deployment](#deployment)
+- [Usage](#usage)
+- [Query examples](#query-examples)
+- [Contributing](#contributing)
+- [License](#license)
 
 ## Features
 
@@ -11,7 +27,7 @@ A CosmWasm smart contract implementing a digital tontine system on Safrochain. T
 - **Transparent Tracking**: On-chain event logging for all operations
 - **Flexible Membership**: Public or invite-only circles with configurable member limits
 
-## Contract Structure
+## Contract structure
 
 - `src/contract.rs` - Entry points (instantiate, execute, query)
 - `src/execute.rs` - Execute message handlers
@@ -19,6 +35,13 @@ A CosmWasm smart contract implementing a digital tontine system on Safrochain. T
 - `src/state.rs` - State definitions and storage
 - `src/msg.rs` - Message types
 - `src/error.rs` - Error types
+
+## Documentation
+
+- [Contract states and flow](CONTRACT_STATES_EXPLAINED.md) – State machine (Draft → Open → Full → Running → Completed/Cancelled), allowed actions, and frontend integration.
+- [Build and deployment fixes](FIXES.md) – Known fixes (reference-types, optimizer) and deployment notes.
+- [Deployment scripts](scripts/README.md) – Deploy to testnet/mainnet with `deploy.sh`.
+- [Testing](scripts/README_TEST.md) – Test scripts for create circle, distribution threshold, and full actions.
 
 ## Building
 
@@ -41,18 +64,26 @@ cargo build --release --target wasm32-unknown-unknown
 cargo run --example schema
 ```
 
-### Optimize Build (Recommended)
+### Optimize build (recommended)
+
+The project uses the **single-contract** optimizer (`cosmwasm/optimizer:0.14.0`). Using `workspace-optimizer` is not supported (see [FIXES.md](FIXES.md)).
 
 ```bash
-# Install cosmwasm-optimizer
-docker pull cosmwasm/workspace-optimizer:0.14.0
+# Using Make (recommended)
+make optimize
+```
 
-# Optimize the contract
+Or with Docker directly:
+
+```bash
+docker pull cosmwasm/optimizer:0.14.0
 docker run --rm -v "$(pwd)":/code \
   --mount type=volume,source="$(basename "$(pwd)")_cache",target=/code/target \
   --mount type=volume,source=registry_cache,target=/usr/local/cargo/registry \
-  cosmwasm/workspace-optimizer:0.14.0
+  cosmwasm/optimizer:0.14.0
 ```
+
+If Docker is unavailable, you can try `make optimize-local` (requires `wasm-opt`; see [FIXES.md](FIXES.md) for Safrochain compatibility).
 
 ## Deployment
 
@@ -165,6 +196,10 @@ Send SAF tokens along with:
 }
 ```
 
+## Contributing
+
+Contributions are welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md) and our [Code of Conduct](CODE_OF_CONDUCT.md) before opening an issue or pull request.
+
 ## License
 
-[Your License Here]
+This project is licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for the full text.

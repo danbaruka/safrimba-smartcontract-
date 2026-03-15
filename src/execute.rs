@@ -670,11 +670,11 @@ fn execute_join_circle(
                     && (circle.members_list.len() as u32) >= circle.min_members_required
                 {
                     generate_payout_order(&mut circle, &env);
-                    if circle.start_date.is_none() {
-                        circle.start_date = Some(env.block.time);
-                        circle.first_cycle_date = Some(env.block.time);
-                        circle.next_payout_date = Some(env.block.time);
-                    }
+                    // Always use actual on-chain time as the start so the calendar
+                    // anchors to when the circle truly started, not a pre-set date.
+                    circle.start_date = Some(env.block.time);
+                    circle.first_cycle_date = Some(env.block.time);
+                    circle.next_payout_date = Some(env.block.time);
                     circle.circle_status = CircleStatus::Running;
                     circle.current_cycle_index = 1;
                 }
@@ -1080,7 +1080,9 @@ fn execute_start_circle(
 
     generate_payout_order(&mut circle, &env);
 
-    let start_timestamp = circle.start_date.unwrap_or(env.block.time);
+    // Always use the actual on-chain time as the start — not the pre-set start_date
+    // which may have been set to a future date at creation time.
+    let start_timestamp = env.block.time;
     circle.start_date = Some(start_timestamp);
     circle.first_cycle_date = Some(start_timestamp);
     circle.next_payout_date = Some(start_timestamp);
