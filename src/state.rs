@@ -218,32 +218,6 @@ pub struct PlatformConfig {
     pub platform_address: Addr,
 }
 
-// Staking configuration per circle
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
-pub struct CircleStakingConfig {
-    pub enabled: bool,
-    pub validator_address: String,
-    pub staked_amount: Uint128,
-    pub total_rewards_earned: Uint128,
-    pub rewards_accumulated: Uint128,
-    pub last_claim_at: Option<Timestamp>,
-    pub pending_undelegations: Vec<PendingUndelegation>,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
-pub struct PendingUndelegation {
-    pub amount: Uint128,
-    pub available_at: Timestamp,
-    pub reason: String,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
-pub struct PendingRefundRecord {
-    pub member: Addr,
-    pub amount: Uint128,
-    pub available_at: Timestamp,
-}
-
 // --- INVARIANTS (must hold after every execute) ---
 // total_pending_payouts == sum(PENDING_PAYOUTS for all members of circle)
 // total_amount_locked == creator_lock_amount + sum(MEMBER_LOCKED_AMOUNTS for circle)
@@ -275,7 +249,3 @@ pub const MEMBER_LAST_DEPOSITED_CYCLE: Map<(u64, Addr), u32> = Map::new("member_
 pub const BLOCKED_MEMBERS: Map<(u64, Addr), u32> = Map::new("blocked_members");
 pub const MEMBER_PSEUDONYMS: Map<(u64, Addr), String> = Map::new("member_pseudonyms");
 pub const PRIVATE_MEMBER_LIST: Map<u64, Vec<Addr>> = Map::new("private_member_list");
-
-// Staking: per-circle staking config; refunds queued when liquid balance insufficient
-pub const CIRCLE_STAKING: Map<u64, CircleStakingConfig> = Map::new("circle_staking");
-pub const PENDING_REFUNDS: Map<(u64, Addr), PendingRefundRecord> = Map::new("pending_refunds");

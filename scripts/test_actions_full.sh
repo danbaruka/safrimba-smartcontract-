@@ -18,7 +18,7 @@
 #   StartCircle, DepositContribution, AdvanceRound, ProcessPayout, Withdraw,
 #   ExitCircle (before & after start), CancelCircle (before & after start),
 #   PauseCircle, UnpauseCircle, CheckAndEject, BlockMember, DistributeBlockedFunds,
-#   UpdateCircle, EmergencyStop, UndelegateForWithdrawals
+#   UpdateCircle, EmergencyStop
 #
 set +e
 
@@ -512,8 +512,6 @@ run_test "GetMemberStats"       do_query_test "GetMemberStats" "$(jq -n --arg a 
 run_test "GetMemberLockedAmount" do_query_test "GetMemberLockedAmount" "$(jq -n --arg a "$CREATOR_ADDR" '{get_member_locked_amount:{circle_id:1,member:$a}}')"
 run_test "GetBlockedMembers(1)" do_query_test "GetBlockedMembers" '{"get_blocked_members":{"circle_id":1}}'
 run_test "GetDistributionCalendar" do_query_test "GetDistributionCalendar" '{"get_distribution_calendar":{"circle_id":1}}'
-run_test "GetCircleStakingInfo" do_query_test "GetCircleStakingInfo" '{"get_circle_staking_info":{"circle_id":1}}'
-run_test "GetPendingRefunds(1)" do_query_test "GetPendingRefunds" '{"get_pending_refunds":{"circle_id":1}}'
 log ""
 
 # ── FINAL STATUS CHECK ───────────────────────────────────────────────────────

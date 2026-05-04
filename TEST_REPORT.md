@@ -165,8 +165,6 @@ Member:  mywallet (addr_safro1f8a9m8r5dq046qvmm9h5eryk0fn0u7tqu6v6sn)
   ✓ PASS: GetMemberLockedAmount
   ✓ PASS: GetBlockedMembers(1)
   ✓ PASS: GetDistributionCalendar
-  ✓ PASS: GetCircleStakingInfo
-  ✓ PASS: GetPendingRefunds(1)
 
 [21] FINAL STATUS CHECK
   Circle 1: status=Paused, members=2, cycle=4, pending_payouts=0

@@ -10,7 +10,7 @@ use crate::query::{
     query_payout_history, query_payouts, query_penalties, query_refunds, query_circles,
     query_member_locked_amount, query_blocked_members, query_member_pseudonym,
     query_private_members, query_distribution_calendar, query_archived_date, query_pending_payout,
-    query_member_accumulated_late_fees, query_circle_staking_info, query_pending_refunds,
+    query_member_accumulated_late_fees,
 };
 use crate::state::PlatformConfig;
 
@@ -153,12 +153,6 @@ pub fn query(deps: Deps, env: Env, msg: QueryMsg) -> StdResult<Binary> {
             cosmwasm_std::to_json_binary(&query_deposit_requirement(
                 deps, env, circle_id, member,
             )?)
-        }
-        QueryMsg::GetCircleStakingInfo { circle_id } => {
-            cosmwasm_std::to_json_binary(&query_circle_staking_info(deps, env, circle_id)?)
-        }
-        QueryMsg::GetPendingRefunds { circle_id, member } => {
-            cosmwasm_std::to_json_binary(&query_pending_refunds(deps, env, circle_id, member)?)
         }
         QueryMsg::GetContractVersion {} => cosmwasm_std::to_json_binary(&ContractVersionResponse {
             api_version: CONTRACT_API_VERSION,

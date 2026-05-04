@@ -1,4 +1,5 @@
 use cosmwasm_std::{Addr, Uint128, Timestamp};
+use cosmwasm_schema::QueryResponses;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -73,7 +74,7 @@ pub enum ExecuteMsg {
         circle_id: u64,
         member_address: Addr,
     },
-    /// Exit circle. Before start: full refund. After start (strict_mode=false only): refund locked minus accumulated late fees minus exit penalty.
+    /// Exit circle. Before start: full refund. After start: only if strict_mode is false — refund locked minus accumulated late fees minus exit penalty. If strict_mode is true, ExitCircle is not allowed after start (members may only leave via automatic ejection).
     ExitCircle {
         circle_id: u64,
     },
@@ -142,79 +143,84 @@ pub enum ExecuteMsg {
         circle_id: u64,
         cycle: u32,
     },
-    // Staking
-    EnableStaking {
-        circle_id: u64,
-        validator_address: String,
-    },
-    DisableStaking {
-        circle_id: u64,
-    },
-    ClaimPendingRefund {
-        circle_id: u64,
-    },
-    /// When circle is Finalizing and has staked tokens, undelegate so they become available for withdrawal (after unbonding period). Callable by anyone.
-    UndelegateForWithdrawals {
-        circle_id: u64,
-    },
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, QueryResponses)]
 #[serde(rename_all = "snake_case")]
 pub enum QueryMsg {
     // Circle Queries
+    #[returns(CircleResponse)]
     GetCircle { circle_id: u64 },
+    #[returns(CirclesResponse)]
     GetCircles {
         start_after: Option<u64>,
         limit: Option<u32>,
         status: Option<CircleStatus>,
         creator: Option<Addr>,
     },
+    #[returns(MembersResponse)]
     GetCircleMembers { circle_id: u64 },
+    #[returns(StatusResponse)]
     GetCircleStatus { circle_id: u64 },
 
     // Cycle Queries
+    #[returns(CycleResponse)]
     GetCurrentCycle { circle_id: u64 },
+    #[returns(DepositsResponse)]
     GetCycleDeposits { circle_id: u64, cycle: u32 },
+    #[returns(DepositsResponse)]
     GetMemberDeposits { circle_id: u64, member: Addr },
 
     // Payout Queries
+    #[returns(PayoutsResponse)]
     GetPayouts { circle_id: u64 },
+    #[returns(PayoutsResponse)]
     GetPayoutHistory { circle_id: u64, cycle: Option<u32> },
 
     // Financial Queries
+    #[returns(BalanceResponse)]
     GetCircleBalance { circle_id: u64 },
+    #[returns(BalanceResponse)]
     GetMemberBalance { circle_id: u64, member: Addr },
+    #[returns(PenaltiesResponse)]
     GetPenalties { circle_id: u64, member: Option<Addr> },
+    #[returns(RefundsResponse)]
     GetRefunds { circle_id: u64 },
 
     // Pending payouts and late fees
+    #[returns(PendingPayoutResponse)]
     GetPendingPayout { circle_id: u64, member: Addr },
+    #[returns(AccumulatedLateFeesResponse)]
     GetMemberAccumulatedLateFees { circle_id: u64, member: Addr },
+    #[returns(DepositRequirementResponse)]
     GetDepositRequirement { circle_id: u64, member: Addr },
 
     // Event Queries
+    #[returns(EventsResponse)]
     GetEvents { circle_id: u64, limit: Option<u32> },
 
     // Statistics
+    #[returns(CircleStatsResponse)]
     GetCircleStats { circle_id: u64 },
+    #[returns(MemberStatsResponse)]
     GetMemberStats { circle_id: u64, member: Addr },
 
     // Locking and Private Circle Queries
+    #[returns(MemberLockedAmountResponse)]
     GetMemberLockedAmount { circle_id: u64, member: Addr },
+    #[returns(BlockedMembersResponse)]
     GetBlockedMembers { circle_id: u64 },
+    #[returns(MemberPseudonymResponse)]
     GetMemberPseudonym { circle_id: u64, member: Addr },
+    #[returns(PrivateMembersResponse)]
     GetPrivateMembers { circle_id: u64 },
+    #[returns(DistributionCalendarResponse)]
     GetDistributionCalendar { circle_id: u64 },
+    #[returns(ArchivedDateResponse)]
     GetArchivedDate { circle_id: u64 },
-    // Staking
-    GetCircleStakingInfo { circle_id: u64 },
-    GetPendingRefunds {
-        circle_id: u64,
-        member: Option<Addr>,
-    },
 
     /// Returns the contract API version (e.g. 2 for v2). Frontend uses this to choose capabilities.
+    #[returns(ContractVersionResponse)]
     GetContractVersion {},
 }
 
@@ -367,22 +373,6 @@ pub struct DepositRequirementResponse {
     pub can_deposit: bool,
     pub contribution_amount: Uint128,
     pub late_fee_total: Uint128,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
-pub struct CircleStakingInfoResponse {
-    pub enabled: bool,
-    pub validator_address: Option<String>,
-    pub staked_amount: Uint128,
-    pub total_rewards_earned: Uint128,
-    pub rewards_accumulated: Uint128,
-    pub last_claim_at: Option<Timestamp>,
-    pub pending_undelegations: Vec<crate::state::PendingUndelegation>,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
-pub struct PendingRefundsResponse {
-    pub refunds: Vec<crate::state::PendingRefundRecord>,
 }
 
 /// Returned by GetContractVersion. api_version 1 = v1, 2 = v2; frontend maps to capabilities.

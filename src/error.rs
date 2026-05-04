@@ -30,7 +30,7 @@ pub enum ContractError {
     #[error("Circle has not started yet")]
     CircleNotStarted { circle_id: u64 },
 
-    #[error("Circle has already started. Exit not allowed in strict mode")]
+    #[error("Circle has already started. Voluntary exit not allowed (strict mode); use automatic ejection when rules apply")]
     StrictModeNoExit { circle_id: u64 },
 
     #[error("Exit not allowed")]
