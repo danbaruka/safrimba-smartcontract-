@@ -574,7 +574,10 @@ pub fn query_distribution_calendar(
         cosmwasm_std::StdError::generic_err("Circle has not started yet")
     })?;
     
-    // When the first distribution happens: None => round 1; Total => 100% of all members (last round only); MinMembers(N) => from round N to end of cycle.
+    // When the first distribution happens:
+    // - None => round 1 (distribution every round)
+    // - Total => 100% of all members (distribution at end of each cycle only)
+    // - MinMembers(N) => distribution from round N onward (within each cycle)
     let min_round_for_distribution: u32 = match circle.distribution_threshold {
         None => 1,
         Some(DistributionThreshold::Total {}) => circle.max_members,

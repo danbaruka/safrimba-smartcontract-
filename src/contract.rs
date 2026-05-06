@@ -1,4 +1,4 @@
-use cosmwasm_std::{entry_point, Binary, Deps, DepsMut, Env, MessageInfo, Response, StdResult};
+use cosmwasm_std::{entry_point, Binary, Deps, DepsMut, Env, MessageInfo, Order, Response, StdResult};
 use cw2::{get_contract_version, set_contract_version};
 
 use crate::error::ContractError;
@@ -12,7 +12,7 @@ use crate::query::{
     query_private_members, query_distribution_calendar, query_archived_date, query_pending_payout,
     query_member_accumulated_late_fees,
 };
-use crate::state::PlatformConfig;
+use crate::state::{CircleStatus, PlatformConfig, CIRCLES};
 
 const CONTRACT_NAME: &str = "crates.io:safrimba-contract";
 const CONTRACT_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -62,9 +62,32 @@ pub fn migrate(deps: DepsMut, _env: Env, _msg: MigrateMsg) -> Result<Response, C
         CONTRACT_NAME,
         CONTRACT_VERSION,
     )?;
+
+    // Backfill `members_at_start` for circles that auto-started via
+    // `auto_start_when_full + by_members` before that field was being set on
+    // the auto-start path. Without this, scaled max_missed_payments_allowed
+    // computations on subsequent ejections fall back to the unscaled base.
+    let ids: Vec<u64> = CIRCLES
+        .keys(deps.storage, None, None, Order::Ascending)
+        .filter_map(|r| r.ok())
+        .collect();
+    let mut backfilled: u32 = 0;
+    for id in ids {
+        let mut circle = CIRCLES.load(deps.storage, id)?;
+        if matches!(circle.circle_status, CircleStatus::Running)
+            && circle.members_at_start.is_none()
+        {
+            circle.members_at_start = Some(circle.members_list.len() as u32);
+            CIRCLES.save(deps.storage, id, &circle)?;
+            backfilled += 1;
+        }
+    }
+
     Ok(Response::new()
+        .add_attribute("action", "migrate")
         .add_attribute("previous_version", version.version)
-        .add_attribute("new_version", CONTRACT_VERSION))
+        .add_attribute("new_version", CONTRACT_VERSION)
+        .add_attribute("members_at_start_backfilled", backfilled.to_string()))
 }
 
 #[entry_point]

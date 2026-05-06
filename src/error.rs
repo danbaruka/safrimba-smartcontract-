@@ -39,7 +39,7 @@ pub enum ContractError {
     #[error("Minimum members not met. Required: {required}, Current: {current}")]
     MinMembersNotMet { required: u32, current: u32 },
 
-    #[error("Cycle not ready. Next payout date: {next_date}")]
+    #[error("Cycle not ready. Round ends at: {next_date}")]
     CycleNotReady { next_date: u64 },
 
     #[error("Member has not paid for this cycle")]

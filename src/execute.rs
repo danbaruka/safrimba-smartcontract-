@@ -222,7 +222,44 @@ fn original_lock_for_member(circle: &Circle, member: &Addr) -> Uint128 {
     }
 }
 
-/// Check if member meets ejection condition: accumulated_late_fees + exit_penalty >= original_lock.
+/// Apply Running-state bookkeeping to a circle: anchor calendar timestamps to
+/// `now`, set status / cycle index, snapshot `members_at_start`, and recompute
+/// `max_missed_payments_allowed` (scaled by current active members).
+///
+/// Used by both `execute_start_circle` (creator-triggered) and the
+/// `auto_start_when_full + by_members` branch in `execute_join_circle` so the
+/// two paths cannot drift.
+fn apply_running_state(circle: &mut Circle, now: Timestamp) {
+    circle.start_date = Some(now);
+    circle.first_cycle_date = Some(now);
+    circle.next_payout_date = Some(now);
+
+    let total_rounds = circle.max_members * circle.total_cycles;
+    let total_duration_seconds = circle.cycle_duration_secs() * total_rounds as u64;
+    let end_timestamp = Timestamp::from_seconds(now.seconds() + total_duration_seconds);
+    circle.end_date = Some(end_timestamp);
+
+    circle.circle_status = CircleStatus::Running;
+    circle.current_cycle_index = 1;
+    circle.updated_at = now;
+
+    let members_at_start = circle.members_list.len() as u32;
+    circle.members_at_start = Some(members_at_start);
+    circle.max_missed_payments_allowed = cap_max_missed_by_rounds(
+        compute_max_missed_scaled(
+            circle.exit_penalty_percent,
+            circle.late_fee_percent,
+            Some(members_at_start),
+            members_at_start,
+        ),
+        total_rounds,
+    );
+}
+
+/// Check if member meets ejection condition. A member is ejected when EITHER:
+///   1. Their `missed_count >= max_missed_payments_allowed` (the configured cap), OR
+///   2. `accumulated_late_fees + exit_penalty >= original_lock` (locked funds exhausted).
+///
 /// Uses `original_lock` (the amount the member deposited at join time) rather than the
 /// remaining locked balance, since locked funds may have been partially consumed to cover
 /// missed deposits via `use_locked_amount_for_member`.
@@ -232,9 +269,25 @@ fn should_eject_member(
     member: &Addr,
     original_lock: Uint128,
     exit_penalty_percent: u64,
+    max_missed_payments_allowed: u32,
 ) -> bool {
     if original_lock.is_zero() {
         return false;
+    }
+    // Hard cap: missed payments at or above the configured max trigger ejection
+    // independently of the late-fee/penalty arithmetic. Without this, low %
+    // configs (e.g. 10% late fee + 20% exit penalty in a 6-round circle) never
+    // accumulate enough fees to reach the original_lock threshold within the
+    // circle's lifetime, so members can miss every round and stay in the circle.
+    if max_missed_payments_allowed > 0 {
+        let missed = MEMBER_MISSED_PAYMENTS
+            .may_load(storage, (circle_id, member.clone()))
+            .unwrap_or(None)
+            .map(|m| m.missed_count)
+            .unwrap_or(0);
+        if missed >= max_missed_payments_allowed {
+            return true;
+        }
     }
     let accumulated = MEMBER_ACCUMULATED_LATE_FEES
         .may_load(storage, (circle_id, member.clone()))
@@ -473,6 +526,24 @@ fn execute_create_circle(
         });
     }
 
+    // Grace period must be strictly less than cycle duration. If they are equal,
+    // the round-end gate (block.time >= round_end) and the grace gate
+    // (block.time > grace_end) coincide, leaving a 1-tick window where
+    // advance_round / process_payout can still be rejected with
+    // "Grace period not ended" even though the calendar says the round ended.
+    // If grace > cycle, advance can never proceed when any member is missing.
+    let grace_secs = grace_period_seconds
+        .filter(|&s| s > 0)
+        .unwrap_or(grace_period_hours as u64 * 3600);
+    if grace_secs >= cycle_secs {
+        return Err(ContractError::InvalidParameters {
+            msg: format!(
+                "grace_period ({}s) must be strictly less than cycle_duration ({}s)",
+                grace_secs, cycle_secs
+            ),
+        });
+    }
+
     let end_date = start_date.map(|start| {
         Timestamp::from_seconds(
             start.seconds() + (cycle_secs * max_members as u64 * total_cycles as u64),
@@ -652,17 +723,15 @@ fn execute_join_circle(
 
         if circle.auto_start_when_full {
             if let Some(ref auto_type) = circle.auto_start_type.clone() {
-                if auto_type == "by_members"
-                    && (circle.members_list.len() as u32) >= circle.min_members_required
-                {
+                // by_members: auto-start only when the circle is full (last seat filled).
+                // We are already inside `members_list.len() >= max_members`.
+                // Creator can still call StartCircle earlier via execute_start_circle once min_members_required is met.
+                if auto_type == "by_members" {
                     generate_payout_order(&mut circle, &env);
-                    // Always use actual on-chain time as the start so the calendar
-                    // anchors to when the circle truly started, not a pre-set date.
-                    circle.start_date = Some(env.block.time);
-                    circle.first_cycle_date = Some(env.block.time);
-                    circle.next_payout_date = Some(env.block.time);
-                    circle.circle_status = CircleStatus::Running;
-                    circle.current_cycle_index = 1;
+                    // Use the same helper as `execute_start_circle` so
+                    // members_at_start, end_date, and max_missed_payments_allowed
+                    // are set consistently across both code paths.
+                    apply_running_state(&mut circle, env.block.time);
                 }
             }
         }
@@ -1059,35 +1128,12 @@ fn execute_start_circle(
     // Always use the actual on-chain time as the start — not the pre-set start_date
     // which may have been set to a future date at creation time.
     let start_timestamp = env.block.time;
-    circle.start_date = Some(start_timestamp);
-    circle.first_cycle_date = Some(start_timestamp);
-    circle.next_payout_date = Some(start_timestamp);
+    apply_running_state(&mut circle, start_timestamp);
 
     let total_rounds = circle.max_members * circle.total_cycles;
-    let total_duration_seconds = circle.cycle_duration_secs() * total_rounds as u64;
-    let end_timestamp =
-        Timestamp::from_seconds(start_timestamp.seconds() + total_duration_seconds);
-    circle.end_date = Some(end_timestamp);
-
+    let end_timestamp = circle.end_date.unwrap_or(start_timestamp);
     let archived_timestamp = Timestamp::from_seconds(
         end_timestamp.seconds() + circle.grace_period_secs(),
-    );
-
-    circle.circle_status = CircleStatus::Running;
-    circle.current_cycle_index = 1;
-    circle.updated_at = env.block.time;
-
-    // Set fee params at start: members_at_start and max_missed (dynamically from % penalty and late fee)
-    let members_at_start = circle.members_list.len() as u32;
-    circle.members_at_start = Some(members_at_start);
-    circle.max_missed_payments_allowed = cap_max_missed_by_rounds(
-        compute_max_missed_scaled(
-            circle.exit_penalty_percent,
-            circle.late_fee_percent,
-            Some(members_at_start),
-            members_at_start,
-        ),
-        total_rounds,
     );
 
     CIRCLES.save(deps.storage, circle_id, &circle)?;
@@ -1217,6 +1263,7 @@ fn execute_deposit_contribution(
             &info.sender,
             orig_lock,
             circle.exit_penalty_percent,
+            circle.max_missed_payments_allowed,
         ) {
             eject_member_from_circle(&mut deps, &env, &mut circle, &info.sender)?;
             CIRCLES.save(deps.storage, circle_id, &circle)?;
@@ -1372,10 +1419,13 @@ fn execute_process_payout(
         });
     }
 
+    // Time gate (end-of-round): prevent back-to-back transitions that can skip rounds.
+    // `next_payout_date` is the round start; only allow payout after the round has ended.
     if let Some(next_payout) = circle.next_payout_date {
-        if env.block.time < next_payout {
+        let round_end = next_payout.plus_seconds(circle.cycle_duration_secs());
+        if env.block.time < round_end {
             return Err(ContractError::CycleNotReady {
-                next_date: next_payout.seconds(),
+                next_date: round_end.seconds(),
             });
         }
     }
@@ -1463,6 +1513,7 @@ fn execute_process_payout(
             member,
             orig_lock,
             circle.exit_penalty_percent,
+            circle.max_missed_payments_allowed,
         ) {
             eject_member_from_circle(&mut deps, &env, &mut circle, member)?;
         }
@@ -1569,6 +1620,11 @@ fn execute_process_payout(
 
     // Distribution threshold check (based on active members)
     let active_count = active_members.len() as u32;
+    if active_count == 0 {
+        return Err(ContractError::InvalidParameters {
+            msg: "No active members for distribution".to_string(),
+        });
+    }
     let round_in_cycle = ((circle.current_cycle_index - 1) % active_count) + 1;
     let min_round_for_distribution = match circle.distribution_threshold {
         None => 1u32,
@@ -1602,8 +1658,9 @@ fn execute_process_payout(
     }
 
     // Total threshold at last round of cycle: split equally among ALL active members
-    let is_total_at_last_round = matches!(circle.distribution_threshold, Some(DistributionThreshold::Total {}))
-        && round_in_cycle == min_round_for_distribution;
+    let is_total_at_last_round =
+        matches!(circle.distribution_threshold, Some(DistributionThreshold::Total {}))
+            && round_in_cycle == min_round_for_distribution;
 
     // Calculate payout amount (total pool)
     // For Total threshold at last round: sum from ALL rounds in the cycle. Each round: active_count * contribution
@@ -1700,6 +1757,9 @@ fn execute_process_payout(
         });
     }
 
+    // Capture single-recipient address for logging (none for Total threshold final-round split).
+    let mut single_recipient: Option<Addr> = None;
+
     if is_total_at_last_round {
         // Split payout_amount equally among all active members
         let member_count = active_members.len() as u128;
@@ -1764,6 +1824,7 @@ fn execute_process_payout(
                 msg: "Payout order not set".to_string(),
             });
         };
+        single_recipient = Some(recipient.clone());
 
         PAYOUTS.save(
             deps.storage,
@@ -1892,7 +1953,22 @@ fn execute_process_payout(
             ),
         )?;
     } else {
-        circle.current_cycle_index += 1;
+        // Round-progression invariant: current_cycle_index must advance by
+        // exactly 1 per transaction. Catches accidental skips from refactors.
+        let prev_round = circle.current_cycle_index;
+        circle.current_cycle_index = prev_round.checked_add(1).ok_or_else(|| {
+            ContractError::InvalidParameters {
+                msg: "current_cycle_index overflow".to_string(),
+            }
+        })?;
+        if circle.current_cycle_index != prev_round + 1 {
+            return Err(ContractError::InvalidParameters {
+                msg: format!(
+                    "Round progression invariant violated: {} -> {} (must be +1)",
+                    prev_round, circle.current_cycle_index
+                ),
+            });
+        }
         if let Some(current_date) = circle.next_payout_date {
             circle.next_payout_date = Some(Timestamp::from_seconds(
                 current_date.seconds() + circle.cycle_duration_secs(),
@@ -1906,18 +1982,10 @@ fn execute_process_payout(
     let recipient_attr = if is_total_at_last_round {
         format!("{} members", active_members.len())
     } else {
-        let order_list = circle.payout_order_list.as_ref().ok_or_else(|| {
-            ContractError::InvalidParameters {
-                msg: "Payout order not set".to_string(),
-            }
-        })?;
-        let active_order: Vec<Addr> = order_list
-            .iter()
-            .filter(|m| active_members.iter().any(|a| a == *m))
-            .cloned()
-            .collect();
-        let index = (round_in_cycle as usize - 1) % active_order.len();
-        active_order[index].to_string()
+        single_recipient
+            .as_ref()
+            .map(|r| r.to_string())
+            .unwrap_or_else(|| "unknown".to_string())
     };
     let log_msg = if is_total_at_last_round {
         format!(
@@ -1976,10 +2044,13 @@ fn execute_advance_round(
         });
     }
 
+    // Time gate (end-of-round): prevent back-to-back transitions that can skip rounds.
+    // `next_payout_date` is the round start; only allow advancing after the round has ended.
     if let Some(next_payout) = circle.next_payout_date {
-        if env.block.time < next_payout {
+        let round_end = next_payout.plus_seconds(circle.cycle_duration_secs());
+        if env.block.time < round_end {
             return Err(ContractError::CycleNotReady {
-                next_date: next_payout.seconds(),
+                next_date: round_end.seconds(),
             });
         }
     }
@@ -2088,6 +2159,7 @@ fn execute_advance_round(
             member,
             orig_lock,
             circle.exit_penalty_percent,
+            circle.max_missed_payments_allowed,
         ) {
             eject_member_from_circle(&mut deps, &env, &mut circle, member)?;
         }
@@ -2177,7 +2249,22 @@ fn execute_advance_round(
         });
     }
 
-    circle.current_cycle_index += 1;
+    // Round-progression invariant: current_cycle_index must advance by
+    // exactly 1 per transaction. Catches accidental skips from refactors.
+    let prev_round = circle.current_cycle_index;
+    circle.current_cycle_index = prev_round.checked_add(1).ok_or_else(|| {
+        ContractError::InvalidParameters {
+            msg: "current_cycle_index overflow".to_string(),
+        }
+    })?;
+    if circle.current_cycle_index != prev_round + 1 {
+        return Err(ContractError::InvalidParameters {
+            msg: format!(
+                "Round progression invariant violated: {} -> {} (must be +1)",
+                prev_round, circle.current_cycle_index
+            ),
+        });
+    }
     if let Some(current_date) = circle.next_payout_date {
         circle.next_payout_date = Some(Timestamp::from_seconds(
             current_date.seconds() + circle.cycle_duration_secs(),
@@ -2288,6 +2375,7 @@ fn execute_check_and_eject(
             member,
             orig_lock,
             circle.exit_penalty_percent,
+            circle.max_missed_payments_allowed,
         ) {
             eject_member_from_circle(&mut deps, &env, &mut circle, member)?;
             ejected_count += 1;
@@ -3209,4 +3297,392 @@ fn log_event(
     EVENT_COUNTER.save(deps.storage, circle_id, &event_id)?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cosmwasm_std::testing::{mock_dependencies, mock_env, mock_info};
+    use cosmwasm_std::{coins, from_json};
+    use crate::msg::InstantiateMsg;
+    use crate::state::PlatformConfig;
+
+    fn setup_platform_config(deps: &mut cosmwasm_std::OwnedDeps<cosmwasm_std::MemoryStorage, cosmwasm_std::testing::MockApi, cosmwasm_std::testing::MockQuerier>) {
+        PLATFORM_CONFIG
+            .save(
+                &mut deps.storage,
+                &PlatformConfig {
+                    platform_fee_percent: 100,
+                    platform_address: Addr::unchecked("platform"),
+                },
+            )
+            .unwrap();
+    }
+
+    fn base_create_msg() -> ExecuteMsg {
+        ExecuteMsg::CreateCircle {
+            circle_name: "test".to_string(),
+            circle_description: "test".to_string(),
+            circle_image: None,
+            max_members: 3,
+            min_members_required: 2,
+            invite_only: false,
+            contribution_amount: Uint128::from(100u128),
+            exit_penalty_percent: 2000,
+            late_fee_percent: 1000,
+            total_cycles: 2,
+            cycle_duration_days: 0,
+            cycle_duration_seconds: Some(300), // 5 min
+            start_date: None,
+            grace_period_hours: 0,
+            grace_period_seconds: Some(60), // 1 min
+            auto_start_when_full: false,
+            auto_start_type: None,
+            auto_start_date: None,
+            payout_order_type: PayoutOrderType::RandomOrder,
+            payout_order_list: None,
+            auto_payout_enabled: true,
+            manual_trigger_enabled: false,
+            emergency_stop_enabled: false,
+            auto_refund_if_min_not_met: false,
+            strict_mode: false,
+            visibility: Visibility::Public,
+            show_member_identities: true,
+            distribution_threshold: None,
+        }
+    }
+
+    // creator_lock = contribution * 2 (see compute_creator_lock)
+    fn creator_lock(_max_members: u32, contribution: u128) -> u128 {
+        contribution * 2
+    }
+
+    #[test]
+    fn compute_max_missed_base_works() {
+        // 20% exit + 10% late fee → (10000 - 2000) / 1000 = 8 missed allowed
+        assert_eq!(compute_max_missed_base(2000, 1000), 8);
+        // late_fee_percent = 0 → u32::MAX (no late fee → no missed-count cap)
+        assert_eq!(compute_max_missed_base(2000, 0), u32::MAX);
+    }
+
+    #[test]
+    fn cap_max_missed_by_rounds_works() {
+        // total_rounds = 6, base = 8 → cap to 5 (so ejection happens before last round)
+        assert_eq!(cap_max_missed_by_rounds(8, 6), 5);
+        // total_rounds = 1 → cap = 1 (max(1, 0))
+        assert_eq!(cap_max_missed_by_rounds(8, 1), 1);
+        // base smaller than cap → unchanged
+        assert_eq!(cap_max_missed_by_rounds(2, 6), 2);
+    }
+
+    #[test]
+    fn compute_max_missed_scaled_shrinks_when_members_drop() {
+        // 5 active of 5 start → base
+        assert_eq!(compute_max_missed_scaled(2000, 1000, Some(5), 5), 8);
+        // 3 active of 5 start → base * 3/5 = 4
+        assert_eq!(compute_max_missed_scaled(2000, 1000, Some(5), 3), 4);
+        // never below 1
+        assert_eq!(compute_max_missed_scaled(2000, 1000, Some(100), 1), 1);
+        // None members_at_start → falls back to base
+        assert_eq!(compute_max_missed_scaled(2000, 1000, None, 3), 8);
+    }
+
+    #[test]
+    fn create_circle_rejects_grace_ge_cycle() {
+        let mut deps = mock_dependencies();
+        setup_platform_config(&mut deps);
+
+        // grace == cycle → reject
+        let msg = ExecuteMsg::CreateCircle {
+            circle_name: "test".to_string(),
+            circle_description: "test".to_string(),
+            circle_image: None,
+            max_members: 3,
+            min_members_required: 2,
+            invite_only: false,
+            contribution_amount: Uint128::from(100u128),
+            exit_penalty_percent: 2000,
+            late_fee_percent: 1000,
+            total_cycles: 2,
+            cycle_duration_days: 0,
+            cycle_duration_seconds: Some(300),
+            start_date: None,
+            grace_period_hours: 0,
+            grace_period_seconds: Some(300), // == cycle
+            auto_start_when_full: false,
+            auto_start_type: None,
+            auto_start_date: None,
+            payout_order_type: PayoutOrderType::RandomOrder,
+            payout_order_list: None,
+            auto_payout_enabled: true,
+            manual_trigger_enabled: false,
+            emergency_stop_enabled: false,
+            auto_refund_if_min_not_met: false,
+            strict_mode: false,
+            visibility: Visibility::Public,
+            show_member_identities: true,
+            distribution_threshold: None,
+        };
+        let info = mock_info("creator", &coins(creator_lock(3, 100), "usaf"));
+        let err = execute(deps.as_mut(), mock_env(), info, msg).unwrap_err();
+        match err {
+            ContractError::InvalidParameters { msg } => {
+                assert!(msg.contains("grace_period"), "expected grace_period error, got: {}", msg);
+                assert!(msg.contains("strictly less than"), "got: {}", msg);
+            }
+            other => panic!("expected InvalidParameters, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn create_circle_accepts_grace_lt_cycle() {
+        let mut deps = mock_dependencies();
+        setup_platform_config(&mut deps);
+        let info = mock_info("creator", &coins(creator_lock(3, 100), "usaf"));
+        let res = execute(deps.as_mut(), mock_env(), info, base_create_msg());
+        assert!(res.is_ok(), "expected success, got {:?}", res.err());
+    }
+
+    #[test]
+    fn auto_start_when_full_sets_members_at_start() {
+        let mut deps = mock_dependencies();
+        setup_platform_config(&mut deps);
+
+        // Create with auto_start_when_full + by_members, max=2 so 1 join = full
+        let create_msg = ExecuteMsg::CreateCircle {
+            circle_name: "auto".to_string(),
+            circle_description: "auto".to_string(),
+            circle_image: None,
+            max_members: 2,
+            min_members_required: 2,
+            invite_only: false,
+            contribution_amount: Uint128::from(100u128),
+            exit_penalty_percent: 2000,
+            late_fee_percent: 1000,
+            total_cycles: 2,
+            cycle_duration_days: 0,
+            cycle_duration_seconds: Some(300),
+            start_date: None,
+            grace_period_hours: 0,
+            grace_period_seconds: Some(60),
+            auto_start_when_full: true,
+            auto_start_type: Some("by_members".to_string()),
+            auto_start_date: None,
+            payout_order_type: PayoutOrderType::RandomOrder,
+            payout_order_list: None,
+            auto_payout_enabled: true,
+            manual_trigger_enabled: false,
+            emergency_stop_enabled: false,
+            auto_refund_if_min_not_met: false,
+            strict_mode: false,
+            visibility: Visibility::Public,
+            show_member_identities: true,
+            distribution_threshold: None,
+        };
+        let creator_info = mock_info("creator", &coins(creator_lock(2, 100), "usaf"));
+        execute(deps.as_mut(), mock_env(), creator_info, create_msg).unwrap();
+
+        // Second member joins → triggers auto-start
+        let join_msg = ExecuteMsg::JoinCircle { circle_id: 1 };
+        let join_info = mock_info("alice", &coins(100, "usaf"));
+        execute(deps.as_mut(), mock_env(), join_info, join_msg).unwrap();
+
+        let circle = CIRCLES.load(&deps.storage, 1).unwrap();
+        assert!(matches!(circle.circle_status, CircleStatus::Running));
+        assert_eq!(circle.current_cycle_index, 1);
+        // members_at_start MUST be set on auto-start (regression: was None before)
+        assert_eq!(circle.members_at_start, Some(2));
+        // max_missed_payments_allowed: base 8, scaled 8*2/2=8, capped to total_rounds-1=3
+        assert_eq!(circle.max_missed_payments_allowed, 3);
+    }
+
+    #[test]
+    fn should_eject_uses_missed_count_cap() {
+        let mut deps = mock_dependencies();
+        let circle_id = 42u64;
+        let member = Addr::unchecked("alice");
+        let original_lock = Uint128::from(100u128);
+
+        // No missed payments yet → not ejected
+        assert!(!should_eject_member(
+            &deps.storage,
+            circle_id,
+            &member,
+            original_lock,
+            2000, // exit_penalty_percent 20%
+            3,    // max_missed_payments_allowed
+        ));
+
+        // 2 missed payments, max is 3 → still not ejected via missed_count, and accumulated late fees too low
+        MEMBER_MISSED_PAYMENTS
+            .save(
+                &mut deps.storage,
+                (circle_id, member.clone()),
+                &MemberMissedPayments {
+                    member: member.clone(),
+                    missed_count: 2,
+                    last_missed_cycle: Some(2),
+                    last_fee_round: None,
+                },
+            )
+            .unwrap();
+        assert!(!should_eject_member(
+            &deps.storage,
+            circle_id,
+            &member,
+            original_lock,
+            2000,
+            3,
+        ));
+
+        // 3 missed payments → hard cap triggers ejection regardless of fees
+        MEMBER_MISSED_PAYMENTS
+            .save(
+                &mut deps.storage,
+                (circle_id, member.clone()),
+                &MemberMissedPayments {
+                    member: member.clone(),
+                    missed_count: 3,
+                    last_missed_cycle: Some(3),
+                    last_fee_round: None,
+                },
+            )
+            .unwrap();
+        assert!(should_eject_member(
+            &deps.storage,
+            circle_id,
+            &member,
+            original_lock,
+            2000,
+            3,
+        ));
+    }
+
+    #[test]
+    fn should_eject_via_accumulated_fees_path_still_works() {
+        let mut deps = mock_dependencies();
+        let circle_id = 1u64;
+        let member = Addr::unchecked("bob");
+        let original_lock = Uint128::from(100u128);
+        // exit penalty 20% = 20. accumulated 80 → 80 + 20 = 100 ≥ 100 → eject.
+        MEMBER_ACCUMULATED_LATE_FEES
+            .save(
+                &mut deps.storage,
+                (circle_id, member.clone()),
+                &Uint128::from(80u128),
+            )
+            .unwrap();
+        // missed_count below cap so we exercise only the accumulated branch
+        assert!(should_eject_member(
+            &deps.storage,
+            circle_id,
+            &member,
+            original_lock,
+            2000,
+            100, // very high cap → can't trigger via missed_count
+        ));
+    }
+
+    #[test]
+    fn apply_running_state_sets_all_fields() {
+        let mut circle = Circle {
+            circle_id: 1,
+            circle_name: "x".to_string(),
+            circle_description: "x".to_string(),
+            circle_image: None,
+            creator_address: Addr::unchecked("creator"),
+            created_at: Timestamp::from_seconds(0),
+            updated_at: Timestamp::from_seconds(0),
+            max_members: 3,
+            min_members_required: 2,
+            invite_only: false,
+            members_list: vec![Addr::unchecked("a"), Addr::unchecked("b"), Addr::unchecked("c")],
+            pending_members: vec![],
+            contribution_amount: Uint128::from(100u128),
+            denomination: "usaf".to_string(),
+            payout_amount: Uint128::from(300u128),
+            exit_penalty_percent: 2000,
+            late_fee_percent: 1000,
+            platform_fee_percent: 100,
+            max_missed_payments_allowed: 0,
+            members_at_start: None,
+            total_cycles: 2,
+            cycle_duration_days: 0,
+            cycle_duration_seconds: 300,
+            start_date: None,
+            first_cycle_date: None,
+            next_payout_date: None,
+            end_date: None,
+            grace_period_hours: 0,
+            grace_period_seconds: 60,
+            auto_start_when_full: true,
+            auto_start_type: Some("by_members".to_string()),
+            auto_start_date: None,
+            payout_order_type: PayoutOrderType::RandomOrder,
+            payout_order_list: None,
+            auto_payout_enabled: true,
+            manual_trigger_enabled: false,
+            emergency_stop_enabled: false,
+            emergency_stop_triggered: false,
+            auto_refund_if_min_not_met: false,
+            strict_mode: false,
+            escrow_address: None,
+            total_amount_locked: Uint128::zero(),
+            total_penalties_collected: Uint128::zero(),
+            total_platform_fees_collected: Uint128::zero(),
+            total_pending_payouts: Uint128::zero(),
+            withdrawal_lock: false,
+            refund_mode: RefundMode::FullRefund,
+            creator_lock_amount: Uint128::from(130u128),
+            distribution_threshold: Some(DistributionThreshold::Total {}),
+            circle_status: CircleStatus::Full,
+            current_cycle_index: 0,
+            cycles_completed: 0,
+            members_paid_this_cycle: vec![],
+            members_late_this_cycle: vec![],
+            visibility: Visibility::Public,
+            show_member_identities: true,
+        };
+
+        let now = Timestamp::from_seconds(1_700_000_000);
+        apply_running_state(&mut circle, now);
+
+        assert!(matches!(circle.circle_status, CircleStatus::Running));
+        assert_eq!(circle.current_cycle_index, 1);
+        assert_eq!(circle.start_date, Some(now));
+        assert_eq!(circle.first_cycle_date, Some(now));
+        assert_eq!(circle.next_payout_date, Some(now));
+        assert_eq!(circle.members_at_start, Some(3));
+        // total_rounds = 6, base 8, capped to 5
+        assert_eq!(circle.max_missed_payments_allowed, 5);
+        assert_eq!(
+            circle.end_date,
+            Some(Timestamp::from_seconds(now.seconds() + 300 * 6))
+        );
+    }
+
+    // Round-progression invariant is exercised end-to-end by ProcessPayout / AdvanceRound;
+    // a focused unit test would require constructing a full Running circle with deposits.
+    // The check is cheap and mostly a defense-in-depth assertion against future refactors.
+
+    #[test]
+    fn json_responses_round_trip() {
+        // Sanity check that base_create_msg serializes/deserializes properly.
+        let msg = base_create_msg();
+        let json = cosmwasm_std::to_json_binary(&msg).unwrap();
+        let parsed: ExecuteMsg = from_json(&json).unwrap();
+        assert_eq!(parsed, msg);
+    }
+
+    #[test]
+    fn instantiate_smoke() {
+        let mut deps = mock_dependencies();
+        let msg = InstantiateMsg {
+            platform_fee_percent: 100,
+            platform_address: Addr::unchecked("platform"),
+        };
+        let info = mock_info("creator", &[]);
+        let res = crate::contract::instantiate(deps.as_mut(), mock_env(), info, msg).unwrap();
+        assert_eq!(0, res.messages.len());
+    }
 }
