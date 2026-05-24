@@ -3,6 +3,8 @@ use cw_storage_plus::{Item, Map};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+/// On-chain circle aggregate. All `Timestamp` fields are Unix epoch instants (seconds ± nanos);
+/// display them as **UTC** when showing human-readable times (no chain-local timezone).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 pub struct Circle {
     // General Information
@@ -11,7 +13,9 @@ pub struct Circle {
     pub circle_description: String,
     pub circle_image: Option<String>,
     pub creator_address: Addr,
+    /// Block time when the circle record was first saved (UTC epoch instant).
     pub created_at: Timestamp,
+    /// Last update time from `env.block.time` when persisted (UTC epoch instant).
     pub updated_at: Timestamp,
 
     // Membership Parameters
@@ -43,9 +47,13 @@ pub struct Circle {
     /// When > 0, overrides cycle_duration_days (for dev/testing with minutes/hours)
     #[serde(default)]
     pub cycle_duration_seconds: u64,
+    /// Scheduled circle / pool start (UTC epoch instant).
     pub start_date: Option<Timestamp>,
+    /// First contribution round start (UTC epoch instant).
     pub first_cycle_date: Option<Timestamp>,
+    /// Start of the **current** round for timing gates (`advance_round` / `process_payout`); UTC epoch instant.
     pub next_payout_date: Option<Timestamp>,
+    /// Scheduled end of the circle (UTC epoch instant).
     pub end_date: Option<Timestamp>,
     pub grace_period_hours: u32,
     /// When > 0, overrides grace_period_hours (for dev/testing with minutes)
@@ -249,3 +257,8 @@ pub const MEMBER_LAST_DEPOSITED_CYCLE: Map<(u64, Addr), u32> = Map::new("member_
 pub const BLOCKED_MEMBERS: Map<(u64, Addr), u32> = Map::new("blocked_members");
 pub const MEMBER_PSEUDONYMS: Map<(u64, Addr), String> = Map::new("member_pseudonyms");
 pub const PRIVATE_MEMBER_LIST: Map<u64, Vec<Addr>> = Map::new("private_member_list");
+/// Platform-funded creator reward credited per circle. Set on first
+/// successful `DepositCreatorReward` call; presence means the reward has
+/// already been credited and a second call must be rejected (idempotency
+/// guard against the server retrying broadcasts at the Finalizing edge).
+pub const CREATOR_REWARDS_CREDITED: Map<u64, Uint128> = Map::new("creator_rewards_credited");

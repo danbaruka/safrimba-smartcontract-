@@ -12,7 +12,7 @@ use crate::query::{
     query_private_members, query_distribution_calendar, query_archived_date, query_pending_payout,
     query_member_accumulated_late_fees,
 };
-use crate::state::{CircleStatus, PlatformConfig, CIRCLES};
+use crate::state::{CircleStatus, DistributionThreshold, PlatformConfig, CIRCLES};
 
 const CONTRACT_NAME: &str = "crates.io:safrimba-contract";
 const CONTRACT_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -63,23 +63,77 @@ pub fn migrate(deps: DepsMut, _env: Env, _msg: MigrateMsg) -> Result<Response, C
         CONTRACT_VERSION,
     )?;
 
-    // Backfill `members_at_start` for circles that auto-started via
-    // `auto_start_when_full + by_members` before that field was being set on
-    // the auto-start path. Without this, scaled max_missed_payments_allowed
-    // computations on subsequent ejections fall back to the unscaled base.
+    // Per-circle backfills. We make the migration idempotent (every save is
+    // conditional on a stored value being unset/inconsistent) so re-running
+    // migrate is a no-op.
     let ids: Vec<u64> = CIRCLES
         .keys(deps.storage, None, None, Order::Ascending)
         .filter_map(|r| r.ok())
         .collect();
-    let mut backfilled: u32 = 0;
+    let mut members_at_start_backfilled: u32 = 0;
+    let mut threshold_backfilled: u32 = 0;
+    let mut status_healed: u32 = 0;
+    let mut denomination_backfilled: u32 = 0;
     for id in ids {
         let mut circle = CIRCLES.load(deps.storage, id)?;
+        let mut dirty = false;
+
+        // 1) `members_at_start` for circles that auto-started via
+        // `auto_start_when_full + by_members` before that field was being set.
+        // Without this, scaled max_missed_payments_allowed computations on
+        // subsequent ejections fall back to the unscaled base, AND the new
+        // total_rounds calculation in execute_process_payout falls back to
+        // max_members (the pre-fix behavior).
         if matches!(circle.circle_status, CircleStatus::Running)
             && circle.members_at_start.is_none()
         {
             circle.members_at_start = Some(circle.members_list.len() as u32);
+            members_at_start_backfilled += 1;
+            dirty = true;
+        }
+
+        // 2) Pin `distribution_threshold` to an explicit value. The new code
+        // treats `None` exactly like `Total` (last round of cycle distributes
+        // and splits among all active members). Backfilling makes the field
+        // explicit so future code paths, queries, and the calendar agree —
+        // and so the UI never has to guess what `None` means.
+        if circle.distribution_threshold.is_none() {
+            circle.distribution_threshold = Some(DistributionThreshold::Total {});
+            threshold_backfilled += 1;
+            dirty = true;
+        }
+
+        // 3) Heal circles stuck in Running after their last calendar round.
+        // The pre-fix `total_rounds = max_members * total_cycles` allowed
+        // `current_cycle_index` to advance past the calendar's real end
+        // (active_members * total_cycles) without flipping status to
+        // Finalizing. We detect that state and flip it here so the cron stops
+        // queuing phantom rounds and members can withdraw.
+        if matches!(circle.circle_status, CircleStatus::Running) {
+            let basis = circle.members_at_start.unwrap_or(circle.max_members);
+            let real_total_rounds = basis * circle.total_cycles;
+            let overshoot = circle.current_cycle_index >= real_total_rounds
+                || circle.cycles_completed >= circle.total_cycles;
+            if overshoot {
+                circle.circle_status = CircleStatus::Finalizing;
+                status_healed += 1;
+                dirty = true;
+            }
+        }
+
+        // 4) Backfill empty `denomination`. Older circles persisted without
+        // a denomination field (early schema) deserialize to `""`. Treat any
+        // missing/empty value as native SAF (`"usaf"`) to keep deposit/payout/
+        // refund denoms valid. Per-circle allow-list is enforced at
+        // CreateCircle for new circles.
+        if circle.denomination.is_empty() {
+            circle.denomination = "usaf".to_string();
+            denomination_backfilled += 1;
+            dirty = true;
+        }
+
+        if dirty {
             CIRCLES.save(deps.storage, id, &circle)?;
-            backfilled += 1;
         }
     }
 
@@ -87,7 +141,10 @@ pub fn migrate(deps: DepsMut, _env: Env, _msg: MigrateMsg) -> Result<Response, C
         .add_attribute("action", "migrate")
         .add_attribute("previous_version", version.version)
         .add_attribute("new_version", CONTRACT_VERSION)
-        .add_attribute("members_at_start_backfilled", backfilled.to_string()))
+        .add_attribute("members_at_start_backfilled", members_at_start_backfilled.to_string())
+        .add_attribute("distribution_threshold_backfilled", threshold_backfilled.to_string())
+        .add_attribute("running_status_healed", status_healed.to_string())
+        .add_attribute("denomination_backfilled", denomination_backfilled.to_string()))
 }
 
 #[entry_point]

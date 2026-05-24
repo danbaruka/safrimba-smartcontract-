@@ -9,10 +9,32 @@ use crate::msg::ExecuteMsg;
 use crate::state::{
     Circle, CircleStatus, DepositRecord, DistributionThreshold, EventLog, MemberMissedPayments,
     PayoutOrderType, PayoutRecord, PenaltyRecord, RefundMode, Visibility, BLOCKED_MEMBERS,
-    CIRCLE_COUNTER, CIRCLES, DEPOSITS, EVENTS, EVENT_COUNTER, MEMBER_ACCUMULATED_LATE_FEES,
-    MEMBER_LAST_DEPOSITED_CYCLE, MEMBER_LOCKED_AMOUNTS, MEMBER_MISSED_PAYMENTS, MEMBER_PSEUDONYMS,
-    PAYOUTS, PENALTIES, PENDING_PAYOUTS, PLATFORM_CONFIG, PRIVATE_MEMBER_LIST,
+    CIRCLE_COUNTER, CIRCLES, CREATOR_REWARDS_CREDITED, DEPOSITS, EVENTS, EVENT_COUNTER,
+    MEMBER_ACCUMULATED_LATE_FEES, MEMBER_LAST_DEPOSITED_CYCLE, MEMBER_LOCKED_AMOUNTS,
+    MEMBER_MISSED_PAYMENTS, MEMBER_PSEUDONYMS, PAYOUTS, PENALTIES, PENDING_PAYOUTS,
+    PLATFORM_CONFIG, PRIVATE_MEMBER_LIST,
 };
+
+/// First round index (within a savings cycle) where distribution may occur.
+/// `None` means the creator left threshold unset (older private circles) — match app/frontend
+/// behavior: same as [`DistributionThreshold::Total`] using **active** member count.
+fn distribution_min_round_for_active(
+    threshold: &Option<DistributionThreshold>,
+    active_count: u32,
+) -> u32 {
+    match threshold {
+        None | Some(DistributionThreshold::Total {}) => active_count,
+        Some(DistributionThreshold::MinMembers { count }) => (*count).min(active_count),
+    }
+}
+
+/// Whether pooled "full cycle" payout applies at the distribution round (`Total` semantics).
+fn is_total_style_threshold(threshold: &Option<DistributionThreshold>) -> bool {
+    matches!(
+        threshold,
+        None | Some(DistributionThreshold::Total {})
+    )
+}
 
 pub fn execute(
     deps: DepsMut,
@@ -29,6 +51,7 @@ pub fn execute(
             min_members_required,
             invite_only,
             contribution_amount,
+            denomination,
             exit_penalty_percent,
             late_fee_percent,
             total_cycles,
@@ -61,6 +84,7 @@ pub fn execute(
             min_members_required,
             invite_only,
             contribution_amount,
+            denomination,
             exit_penalty_percent,
             late_fee_percent,
             total_cycles,
@@ -128,6 +152,10 @@ pub fn execute(
         ),
         ExecuteMsg::WithdrawPlatformFees { circle_id } => {
             execute_withdraw_platform_fees(deps, env, info, circle_id)
+        }
+        ExecuteMsg::SweepDust { circle_id } => execute_sweep_dust(deps, env, info, circle_id),
+        ExecuteMsg::DepositCreatorReward { circle_id } => {
+            execute_deposit_creator_reward(deps, env, info, circle_id)
         }
         ExecuteMsg::AddPrivateMember {
             circle_id,
@@ -222,6 +250,16 @@ fn original_lock_for_member(circle: &Circle, member: &Addr) -> Uint128 {
     }
 }
 
+/// Read the member's current `MEMBER_LOCKED_AMOUNTS` balance, treating
+/// "no entry" as zero. The creator has no entry (their lock lives in
+/// `circle.creator_lock_amount`), so this is for non-creator members only.
+fn current_member_lock(storage: &dyn Storage, circle_id: u64, member: &Addr) -> Uint128 {
+    MEMBER_LOCKED_AMOUNTS
+        .may_load(storage, (circle_id, member.clone()))
+        .unwrap_or(None)
+        .unwrap_or(Uint128::zero())
+}
+
 /// Apply Running-state bookkeeping to a circle: anchor calendar timestamps to
 /// `now`, set status / cycle index, snapshot `members_at_start`, and recompute
 /// `max_missed_payments_allowed` (scaled by current active members).
@@ -234,7 +272,13 @@ fn apply_running_state(circle: &mut Circle, now: Timestamp) {
     circle.first_cycle_date = Some(now);
     circle.next_payout_date = Some(now);
 
-    let total_rounds = circle.max_members * circle.total_cycles;
+    // Round count is locked at start based on who actually joined, NOT the
+    // configured max. A 3-max-member circle that started with 2 members
+    // has 2 * total_cycles rounds, not 3 * total_cycles. Using max_members
+    // here caused circles to overshoot their calendar and never transition
+    // to Finalizing (the cron kept advancing past the last real round).
+    let members_at_start = circle.members_list.len() as u32;
+    let total_rounds = members_at_start * circle.total_cycles;
     let total_duration_seconds = circle.cycle_duration_secs() * total_rounds as u64;
     let end_timestamp = Timestamp::from_seconds(now.seconds() + total_duration_seconds);
     circle.end_date = Some(end_timestamp);
@@ -243,7 +287,6 @@ fn apply_running_state(circle: &mut Circle, now: Timestamp) {
     circle.current_cycle_index = 1;
     circle.updated_at = now;
 
-    let members_at_start = circle.members_list.len() as u32;
     circle.members_at_start = Some(members_at_start);
     circle.max_missed_payments_allowed = cap_max_missed_by_rounds(
         compute_max_missed_scaled(
@@ -346,8 +389,10 @@ fn eject_member_from_circle(
     missed.last_missed_cycle = Some(circle.current_cycle_index);
     MEMBER_MISSED_PAYMENTS.save(deps.storage, (circle.circle_id, member.clone()), &missed)?;
 
-    // Recompute max_missed_payments_allowed (dynamic from % penalty and late fee, scaled by active members)
-    let total_rounds = circle.max_members * circle.total_cycles;
+    // Recompute max_missed_payments_allowed (dynamic from % penalty and late fee, scaled by active members).
+    // Round count is based on members_at_start (locked when circle started) NOT max_members — see apply_running_state.
+    let members_basis = circle.members_at_start.unwrap_or(circle.max_members);
+    let total_rounds = members_basis * circle.total_cycles;
     circle.max_missed_payments_allowed = cap_max_missed_by_rounds(
         compute_max_missed_scaled(
             circle.exit_penalty_percent,
@@ -357,6 +402,25 @@ fn eject_member_from_circle(
         ),
         total_rounds,
     );
+
+    // Keep `payout_order_list` in sync with `members_list` so the calendar
+    // query (`get_distribution_calendar`) and the per-round recipient picker
+    // in `execute_process_payout` see the same active roster. Previously this
+    // was only done in the `check_and_eject` batch path, so an ejection that
+    // fired from inside `process_payout` / `advance_round` / `deposit` left a
+    // stale order with the blocked address, producing phantom calendar
+    // entries until the next `check_and_eject` swept it.
+    if let Some(ref mut order) = circle.payout_order_list {
+        order.retain(|m| m != member);
+    }
+
+    // Display-only field: keep it consistent with the new active roster size
+    // so the UI doesn't show a payout target that no longer matches reality.
+    // Actual on-chain payout math is recomputed inside `execute_process_payout`.
+    circle.payout_amount = circle
+        .contribution_amount
+        .checked_mul(Uint128::from(circle.members_list.len() as u128))
+        .unwrap_or(circle.payout_amount);
 
     log_event(
         deps,
@@ -368,6 +432,43 @@ fn eject_member_from_circle(
             member, circle.current_cycle_index, locked, accumulated_fees, exit_penalty
         ),
     )?;
+
+    // Re-emit the distribution calendar so off-chain consumers (frontend,
+    // server sync, scheduler) can re-render without waiting for the next
+    // full sync. `members_at_start` is intentionally NOT changed (it locks
+    // the schedule), so total_rounds stays put — only the per-cycle round
+    // recipients shift.
+    let start_ts = circle.first_cycle_date.unwrap_or(env.block.time);
+    let rebuilt = build_distribution_calendar(circle, start_ts);
+    log_event(
+        deps,
+        env,
+        circle.circle_id,
+        "calendar_rebuilt",
+        &format!(
+            "{{reason:\"ejection\",active_members:{},calendar:[{}]}}",
+            circle.members_list.len(),
+            rebuilt
+        ),
+    )?;
+
+    // Soft warning if the roster has fallen below the configured minimum.
+    // We do not auto-cancel — that's a product decision left to the creator
+    // via CancelCircle — but the warning surfaces in the event feed so the
+    // UI can flag the circle for attention.
+    if (circle.members_list.len() as u32) < circle.min_members_required {
+        log_event(
+            deps,
+            env,
+            circle.circle_id,
+            "min_members_breach",
+            &format!(
+                "Active members ({}) below min_members_required ({}) after ejection",
+                circle.members_list.len(),
+                circle.min_members_required
+            ),
+        )?;
+    }
 
     Ok(())
 }
@@ -388,6 +489,7 @@ fn execute_create_circle(
     min_members_required: u32,
     invite_only: bool,
     contribution_amount: Uint128,
+    denomination: Option<String>,
     exit_penalty_percent: u64,
     late_fee_percent: u64,
     total_cycles: u32,
@@ -446,6 +548,36 @@ fn execute_create_circle(
         });
     }
 
+    // Public circles are temporarily disabled at the contract level. Existing
+    // Public circles continue to operate; new ones are rejected. Re-enable by
+    // removing this guard once the public-circle UX is finalized.
+    if matches!(visibility, Visibility::Public) {
+        return Err(ContractError::InvalidParameters {
+            msg: "Public circles are temporarily disabled. Please create a Private (invite-only) circle.".to_string(),
+        });
+    }
+
+    // Validate the payment denomination against the allow-list.
+    // - "usaf"      → native SAF (6 decimals)
+    // - the Noble IBC USDC trace on Safrochain (6 decimals)
+    // Unknown denoms are rejected up-front so a typo can't trap funds in a circle
+    // members will never be able to deposit into.
+    const SAF_DENOM: &str = "usaf";
+    const USDC_DENOM: &str =
+        "ibc/2180E84E20F5679FCC760D8C165B60F42065DEF7F46A72B447CFF1B7DC6C0A65";
+    let chosen_denom: String = match denomination.as_deref() {
+        None | Some("") => SAF_DENOM.to_string(),
+        Some(d) if d == SAF_DENOM || d == USDC_DENOM => d.to_string(),
+        Some(other) => {
+            return Err(ContractError::InvalidParameters {
+                msg: format!(
+                    "denomination '{}' is not supported. Allowed: '{}' or '{}'.",
+                    other, SAF_DENOM, USDC_DENOM
+                ),
+            });
+        }
+    };
+
     // Force distribution_threshold = Total for Public circles
     let effective_threshold = match visibility {
         Visibility::Public => Some(DistributionThreshold::Total {}),
@@ -484,7 +616,7 @@ fn execute_create_circle(
     let required_creator_lock = compute_creator_lock(contribution_amount, max_members)?;
 
     // Validate payment: creator must send exactly required_creator_lock
-    let payment = must_pay(&info, "usaf").map_err(|_| ContractError::InsufficientFunds {
+    let payment = must_pay(&info, &chosen_denom).map_err(|_| ContractError::InsufficientFunds {
         required: required_creator_lock.to_string(),
         sent: "0".to_string(),
     })?;
@@ -575,7 +707,7 @@ fn execute_create_circle(
         members_list: vec![info.sender.clone()],
         pending_members: vec![],
         contribution_amount,
-        denomination: "usaf".to_string(),
+        denomination: chosen_denom.clone(),
         payout_amount,
         exit_penalty_percent,
         late_fee_percent,
@@ -1274,9 +1406,41 @@ fn execute_deposit_contribution(
     }
 
     let late_fee_total = late_fee_per_round * Uint128::from(rounds_missed as u128);
+
+    // CATCH-UP DEPOSIT
+    // ----------------
+    // When a member missed N rounds before depositing, the contract already
+    // drained `N × contribution_amount` from their MEMBER_LOCKED (via the
+    // process_payout / advance_round force-fund path) to keep the schedule
+    // moving. The catch-up payment must:
+    //   1. Cover the current round (contribution_amount)
+    //   2. Refill the lock by the amount that was drained, capped at the
+    //      original_lock - if missed rounds drained 3 × C, they need 3 × C
+    //      to restore. If their lock was 2 × C (creator) we still cap at the
+    //      original limit so they can't accidentally over-fund.
+    //   3. Pay the accumulated late fees (1 × late_fee_per_round per miss)
+    //
+    // After a successful catch-up the member is "fresh": missed_count and
+    // accumulated_late_fees both reset to zero, lock back to original.
+    //
+    // For non-creator members only - creator lock is in `creator_lock_amount`
+    // and is never drained by the round-cover path.
+    let original_lock = original_lock_for_member(&circle, &info.sender);
+    let current_lock = if info.sender == circle.creator_address {
+        Uint128::zero() // creator has no MEMBER_LOCKED entry
+    } else {
+        current_member_lock(deps.storage, circle_id, &info.sender)
+    };
+    let lock_refill_needed = if info.sender == circle.creator_address {
+        Uint128::zero()
+    } else {
+        original_lock.saturating_sub(current_lock)
+    };
+
     let required_amount = circle
         .contribution_amount
-        .checked_add(late_fee_total)
+        .checked_add(lock_refill_needed)
+        .and_then(|v| v.checked_add(late_fee_total))
         .map_err(|_| ContractError::InvalidParameters {
             msg: "Required amount overflow".to_string(),
         })?;
@@ -1322,7 +1486,24 @@ fn execute_deposit_contribution(
         )?;
     }
 
-    // Record deposit
+    // Refill the lock that was drained covering this member's misses, and
+    // reset the per-member miss counters so they get a clean slate.
+    if !lock_refill_needed.is_zero() {
+        add_member_locked(
+            deps.storage,
+            circle_id,
+            &info.sender,
+            lock_refill_needed,
+            &mut circle.total_amount_locked,
+        )?;
+    }
+    if rounds_missed > 0 {
+        MEMBER_ACCUMULATED_LATE_FEES.remove(deps.storage, (circle_id, info.sender.clone()));
+        MEMBER_MISSED_PAYMENTS.remove(deps.storage, (circle_id, info.sender.clone()));
+    }
+
+    // Record deposit (only `contribution_amount` is the deposit proper;
+    // the refill goes into MEMBER_LOCKED above, the late fees into PENALTIES).
     DEPOSITS.save(
         deps.storage,
         (circle_id, info.sender.clone(), circle.current_cycle_index),
@@ -1505,20 +1686,51 @@ fn execute_process_payout(
             )?;
         }
 
-        // Check ejection condition using ORIGINAL lock (not remaining balance)
+        // Determine if this member should be ejected NOW.
+        //
+        // Two independent ejection triggers, by design:
+        //   (a) `should_eject_member` - the standard "missed too many" or
+        //       "accumulated fees exhausted the security" check.
+        //   (b) NEW: their remaining lock can no longer cover this round's
+        //       contribution. Without this guard, a member whose
+        //       MEMBER_LOCKED was depleted by earlier misses (but who hasn't
+        //       yet hit `max_missed_payments_allowed`) would block the round
+        //       forever - `use_locked_amount_for_member` returns 0, no
+        //       synthetic deposit is written, and the post-loop
+        //       `deposits_count < active_members.len()` check fails.
+        //
+        // Per the security contract: a member's lock IS their commitment;
+        // when it can't cover a round, they've effectively defaulted, and
+        // the circle MUST keep running for the remaining members.
         let orig_lock = original_lock_for_member(&circle, member);
-        if should_eject_member(
+        let standard_eject = should_eject_member(
             deps.storage,
             circle_id,
             member,
             orig_lock,
             circle.exit_penalty_percent,
             circle.max_missed_payments_allowed,
-        ) {
+        );
+        let lock_insufficient = if member == &circle.creator_address {
+            // Creator's lock is in `creator_lock_amount`; can't be drained
+            // per-miss the way MEMBER_LOCKED is. Skip this trigger for them
+            // (creator handling is via cancel/finalize, not per-round eject).
+            false
+        } else {
+            current_member_lock(deps.storage, circle_id, member) < circle.contribution_amount
+        };
+
+        if standard_eject || lock_insufficient {
             eject_member_from_circle(&mut deps, &env, &mut circle, member)?;
+            // Ejected: their MEMBER_LOCKED stays in the circle (becomes part
+            // of `total_penalties_collected` per eject logic). No synthetic
+            // deposit for this round - active_members.len() will drop on
+            // the post-loop recount and the round proceeds with the rest.
+            continue;
         }
 
-        // Use locked funds to cover missed deposit — never use creator's lock (creator lock must stay intact)
+        // Use locked funds to cover missed deposit. Creator's lock is never
+        // touched (lives in creator_lock_amount, not MEMBER_LOCKED).
         let used = if member == &circle.creator_address {
             Uint128::zero()
         } else {
@@ -1626,11 +1838,8 @@ fn execute_process_payout(
         });
     }
     let round_in_cycle = ((circle.current_cycle_index - 1) % active_count) + 1;
-    let min_round_for_distribution = match circle.distribution_threshold {
-        None => 1u32,
-        Some(DistributionThreshold::Total {}) => active_count,
-        Some(DistributionThreshold::MinMembers { count }) => count.min(active_count),
-    };
+    let min_round_for_distribution =
+        distribution_min_round_for_active(&circle.distribution_threshold, active_count);
 
     if round_in_cycle < min_round_for_distribution {
         return Err(ContractError::InvalidParameters {
@@ -1641,26 +1850,32 @@ fn execute_process_payout(
         });
     }
 
-    // All active must have contributed (deposit or locked used for missing)
-    let effective_contributors = deposits_count
-        + missing_members
-            .iter()
-            .filter(|m| active_members.contains(m))
-            .count();
-    if effective_contributors < active_members.len() {
+    // All active members must have a real-or-synthetic deposit for this round.
+    //
+    // `deposits_count` is recomputed AFTER the missing-member loop, so it
+    // includes the synthetic DEPOSITS rows just written for members whose
+    // locked join-deposit was consumed to cover the round.
+    //
+    // The previous formulation `deposits_count + |missing_members ∩ active|`
+    // was tautological — since `missing_members ⊆ active_members`, the sum
+    // always equalled `active_members.len()` and the contract therefore
+    // accepted process_payout even when a missing member had ZERO locked
+    // funds left and no synthetic deposit was created. That over-credited
+    // the pool by the missing contribution amount, which is the root cause
+    // of the "PENDING_PAYOUTS > contract bank balance" symptom on Withdraw.
+    if deposits_count < active_members.len() {
         return Err(ContractError::InvalidParameters {
             msg: format!(
-                "Not all active members have contributed: need {}, have {}",
+                "Not all active members have contributed: need {}, have {} (some missing members had no locked funds left to cover this round)",
                 active_members.len(),
-                effective_contributors
+                deposits_count
             ),
         });
     }
 
     // Total threshold at last round of cycle: split equally among ALL active members
-    let is_total_at_last_round =
-        matches!(circle.distribution_threshold, Some(DistributionThreshold::Total {}))
-            && round_in_cycle == min_round_for_distribution;
+    let is_total_at_last_round = is_total_style_threshold(&circle.distribution_threshold)
+        && round_in_cycle == min_round_for_distribution;
 
     // Calculate payout amount (total pool)
     // For Total threshold at last round: sum from ALL rounds in the cycle. Each round: active_count * contribution
@@ -1715,10 +1930,29 @@ fn execute_process_payout(
         })?;
     let available = liquid_balance.amount;
 
+    // Any PENDING_PAYOUTS already credited (from earlier rounds, not yet
+    // withdrawn) must remain backed by bank balance — we cannot credit so
+    // much new payout that the contract can no longer satisfy outstanding
+    // withdrawals. Subtract them from the spendable budget for this TX.
+    let spendable_for_new_credits = available
+        .checked_sub(circle.total_pending_payouts)
+        .unwrap_or(Uint128::zero());
+
     // Compute total we will add to PENDING_PAYOUTS and verify contract has sufficient balance
     let mut total_to_credit = payout_amount;
     let mut creator_refund_amount = Uint128::zero();
-    let total_rounds = circle.max_members * circle.total_cycles;
+    // Total rounds = ACTIVE roster at start × total_cycles. Using `max_members`
+    // here was wrong for circles that auto-started with fewer members than
+    // the cap: e.g. a circle configured `max_members=3, total_cycles=2` that
+    // actually started with 2 members has 4 real rounds, not 6. With the old
+    // formula, `current_cycle_index=4 >= 6` was false on the FINAL round,
+    // the pre-computation block was skipped, `creator_refund_amount` stayed
+    // at zero, and the finalize block below (which uses the correct
+    // `members_at_start` formula) zeroed `creator_lock_amount` without ever
+    // crediting the creator's refund - silently stranding it on the bank.
+    // Must mirror the second `total_rounds` computation further down.
+    let members_basis_pre = circle.members_at_start.unwrap_or(circle.max_members);
+    let total_rounds = members_basis_pre * circle.total_cycles;
     if circle.current_cycle_index >= total_rounds {
         let locked_sum: Uint128 = MEMBER_LOCKED_AMOUNTS
             .prefix(circle_id)
@@ -1738,8 +1972,12 @@ fn execute_process_payout(
             .checked_add(circle.total_penalties_collected)
             .unwrap_or(total_to_credit);
         if !creator_has_locked_entry && !circle.creator_lock_amount.is_zero() {
-            // Refund at most the remaining available funds after mandatory final credits.
-            creator_refund_amount = available
+            // Refund at most the still-spendable funds AFTER honouring
+            // outstanding pending payouts and the mandatory final credits.
+            // Using `available` alone (the prior behaviour) over-credited the
+            // creator when earlier cycles had already committed funds to
+            // PENDING_PAYOUTS, producing the bank-vs-pending mismatch.
+            creator_refund_amount = spendable_for_new_credits
                 .checked_sub(total_to_credit)
                 .unwrap_or(Uint128::zero());
             if creator_refund_amount > circle.creator_lock_amount {
@@ -1750,7 +1988,7 @@ fn execute_process_payout(
                 .unwrap_or(total_to_credit);
         }
     }
-    if available < total_to_credit {
+    if spendable_for_new_credits < total_to_credit {
         return Err(ContractError::InsufficientContractBalance {
             required: total_to_credit.to_string(),
             available: available.to_string(),
@@ -1759,6 +1997,13 @@ fn execute_process_payout(
 
     // Capture single-recipient address for logging (none for Total threshold final-round split).
     let mut single_recipient: Option<Addr> = None;
+
+    // Outbound bank messages produced by this transaction (e.g. platform fee
+    // drain at finalization). Withdrawals are still pulled via Withdraw — this
+    // only carries amounts the contract autonomously sends out (platform fees,
+    // dust). Building it here keeps the response self-contained.
+    let mut outbound_messages: Vec<CosmosMsg> = Vec::new();
+    let mut platform_fees_sent: Uint128 = Uint128::zero();
 
     if is_total_at_last_round {
         // Split payout_amount equally among all active members
@@ -1863,8 +2108,15 @@ fn execute_process_payout(
     circle.members_paid_this_cycle.clear();
     circle.members_late_this_cycle.clear();
 
-    // Check if last round across all cycles
-    let total_rounds = circle.max_members * circle.total_cycles;
+    // Check if last round across all cycles. Round count is based on the
+    // active member count locked at start (members_at_start), NOT the
+    // configured cap (max_members). Using max_members caused circles that
+    // started with fewer members than the cap to keep advancing past their
+    // calendar's last round — status never transitioned to Finalizing, the
+    // cron kept queuing actions, and the UI displayed phantom rounds with
+    // no recipient.
+    let members_basis = circle.members_at_start.unwrap_or(circle.max_members);
+    let total_rounds = members_basis * circle.total_cycles;
     if circle.current_cycle_index >= total_rounds {
         // Set Finalizing — Completed only when all have withdrawn (contract balance = 0)
         circle.circle_status = CircleStatus::Finalizing;
@@ -1942,14 +2194,35 @@ fn execute_process_payout(
         circle.total_amount_locked = Uint128::zero();
         circle.total_penalties_collected = Uint128::zero();
 
+        // Drain accumulated platform fees to the platform address. Before this
+        // fix, `total_platform_fees_collected` was a pure accumulator with no
+        // outflow path — the corresponding native coins remained on the
+        // contract bank balance after finalization, breaking the documented
+        // invariant in state.rs ("Becomes Completed when contract balance = 0").
+        // We send the fees automatically as part of finalization so new circles
+        // are clean by construction.
+        let fees = circle.total_platform_fees_collected;
+        if !fees.is_zero() {
+            let platform_addr = PLATFORM_CONFIG.load(deps.storage)?.platform_address;
+            outbound_messages.push(CosmosMsg::Bank(BankMsg::Send {
+                to_address: platform_addr.to_string(),
+                amount: vec![Coin {
+                    denom: circle.denomination.clone(),
+                    amount: fees,
+                }],
+            }));
+            platform_fees_sent = fees;
+            circle.total_platform_fees_collected = Uint128::zero();
+        }
+
         log_event(
             &mut deps,
             &env,
             circle_id,
             "circle_completed",
             &format!(
-                "Circle {} completed. All payouts stored in PENDING_PAYOUTS.",
-                circle_id
+                "Circle {} completed. All payouts stored in PENDING_PAYOUTS. Platform fees drained: {} usaf.",
+                circle_id, platform_fees_sent
             ),
         )?;
     } else {
@@ -2010,11 +2283,13 @@ fn execute_process_payout(
     )?;
 
     Ok(Response::new()
+        .add_messages(outbound_messages)
         .add_attribute("action", "process_payout")
         .add_attribute("circle_id", circle_id.to_string())
         .add_attribute("cycle", circle.cycles_completed.to_string())
         .add_attribute("recipient", recipient_attr)
         .add_attribute("amount", payout_amount.to_string())
+        .add_attribute("platform_fees_sent", platform_fees_sent.to_string())
         .add_attribute("pending_withdrawal", "true"))
 }
 
@@ -2077,11 +2352,8 @@ fn execute_advance_round(
 
     let active_count = active_members.len() as u32;
     let round_in_cycle = ((circle.current_cycle_index - 1) % active_count) + 1;
-    let min_round_for_distribution = match circle.distribution_threshold {
-        None => 1u32,
-        Some(DistributionThreshold::Total {}) => active_count,
-        Some(DistributionThreshold::MinMembers { count }) => count.min(active_count),
-    };
+    let min_round_for_distribution =
+        distribution_min_round_for_active(&circle.distribution_threshold, active_count);
 
     if round_in_cycle >= min_round_for_distribution {
         return Err(ContractError::InvalidParameters {
@@ -2152,19 +2424,31 @@ fn execute_advance_round(
             )?;
         }
 
+        // Force-eject when lock is insufficient to cover this round - same
+        // rationale as in execute_process_payout's missing-members loop:
+        // rounds must always progress, the member's MEMBER_LOCKED is their
+        // commitment, and a depleted lock means they've defaulted on the
+        // protocol contract. See the longer comment in process_payout.
         let orig_lock = original_lock_for_member(&circle, member);
-        if should_eject_member(
+        let standard_eject = should_eject_member(
             deps.storage,
             circle_id,
             member,
             orig_lock,
             circle.exit_penalty_percent,
             circle.max_missed_payments_allowed,
-        ) {
+        );
+        let lock_insufficient = if member == &circle.creator_address {
+            false
+        } else {
+            current_member_lock(deps.storage, circle_id, member) < circle.contribution_amount
+        };
+        if standard_eject || lock_insufficient {
             eject_member_from_circle(&mut deps, &env, &mut circle, member)?;
+            continue;
         }
 
-        // Never use creator's lock — creator lock must stay intact
+        // Never use creator's lock - creator lock must stay intact
         if member != &circle.creator_address {
             let used = use_locked_amount_for_member(
                 deps.storage,
@@ -2315,9 +2599,24 @@ fn execute_withdraw(
         return Err(ContractError::NoPendingPayouts {});
     }
 
-    // When Finalizing and this is the last withdrawal (total_pending_payouts = 0), mark Completed
-    if circle.circle_status == CircleStatus::Finalizing && circle.total_pending_payouts.is_zero() {
-        circle.circle_status = CircleStatus::Completed;
+    // When Finalizing and this is the last withdrawal, only flip to Completed
+    // if the documented invariant in state.rs actually holds: contract bank
+    // balance, AFTER the BankMsg::Send queued below settles, must be zero AND
+    // no undrained platform fees remain. The previous check (only
+    // `total_pending_payouts.is_zero()`) let the status flip to Completed
+    // while real native funds were still held by the contract (the "Completed
+    // with 26 SAF" bug). Anything residual is recoverable via
+    // `WithdrawPlatformFees` and `SweepDust`.
+    if circle.circle_status == CircleStatus::Finalizing
+        && circle.total_pending_payouts.is_zero()
+    {
+        let bal = deps
+            .querier
+            .query_balance(&env.contract.address, &circle.denomination)?;
+        let post_send = bal.amount.saturating_sub(pending);
+        if post_send.is_zero() && circle.total_platform_fees_collected.is_zero() {
+            circle.circle_status = CircleStatus::Completed;
+        }
     }
 
     circle.updated_at = env.block.time;
@@ -2383,20 +2682,10 @@ fn execute_check_and_eject(
     }
 
     if ejected_count > 0 {
-        // Recalculate payout order
-        if let Some(ref mut order) = circle.payout_order_list {
-            let blocked: Vec<Addr> = BLOCKED_MEMBERS
-                .prefix(circle_id)
-                .range(deps.storage, None, None, Order::Ascending)
-                .filter_map(|res| res.ok().map(|(m, _)| m))
-                .collect();
-            order.retain(|m| !blocked.contains(m));
-        }
-        circle.payout_amount = circle
-            .contribution_amount
-            .checked_mul(Uint128::from(circle.members_list.len() as u128))
-            .unwrap_or(circle.payout_amount);
-
+        // `payout_order_list`, `payout_amount`, the `calendar_rebuilt` event,
+        // and the min-members breach warning are all already handled per-eject
+        // inside `eject_member_from_circle`. Just persist the aggregated state
+        // and bump `updated_at` so the off-chain sync notices the change.
         circle.updated_at = env.block.time;
         CIRCLES.save(deps.storage, circle_id, &circle)?;
     }
@@ -2469,7 +2758,17 @@ fn execute_cancel_circle(
     let mut messages: Vec<CosmosMsg> = Vec::new();
 
     if is_running {
-        // Creator forfeits creator_lock_amount — distributed to active members via PENDING_PAYOUTS
+        // Cancelling a running circle is the creator's choice — so members
+        // should be made whole. The old code path (a) deducted an exit penalty
+        // from each member's lock refund (unfair: the creator cancelled, not
+        // the member), (b) never refunded the current-cycle deposits made by
+        // anyone, (c) never zeroed `creator_lock_amount`, and (d) used direct
+        // BankMsg sends for the lock refund — so the creator (no
+        // MEMBER_LOCKED_AMOUNTS entry) got NOTHING and the UI had no Withdraw
+        // button. This rewrite credits everything via PENDING_PAYOUTS so a
+        // single Withdraw call by each member recovers what they're owed,
+        // and balances out to bank balance == sum(pending) on success.
+
         let active_members: Vec<Addr> = circle
             .members_list
             .iter()
@@ -2483,11 +2782,13 @@ fn execute_cancel_circle(
             .cloned()
             .collect();
 
-        if !circle.creator_lock_amount.is_zero() && !active_members.is_empty() {
+        // 1. Creator forfeits creator_lock_amount → distributed to active
+        //    non-creator members via PENDING_PAYOUTS. Cancellation penalty.
+        let creator_lock = circle.creator_lock_amount;
+        if !creator_lock.is_zero() && !active_members.is_empty() {
             let count = Uint128::from(active_members.len() as u128);
-            let per_member = circle.creator_lock_amount.multiply_ratio(1u128, count.u128());
-            let remainder = circle
-                .creator_lock_amount
+            let per_member = creator_lock.multiply_ratio(1u128, count.u128());
+            let remainder = creator_lock
                 .checked_sub(per_member * count)
                 .unwrap_or(Uint128::zero());
 
@@ -2507,44 +2808,66 @@ fn execute_cancel_circle(
                 }
             }
         }
+        // Always zero out, whether or not there were members to receive it —
+        // otherwise the field stays stale and future invariant checks lie.
+        circle.creator_lock_amount = Uint128::zero();
 
-        // Refund each member's locked join deposit (minus accumulated fees)
+        // 2. Refund each non-creator member's FULL locked join-deposit via
+        //    PENDING_PAYOUTS (no exit penalty when the creator is the one
+        //    cancelling). Creator has no MEMBER_LOCKED entry — their initial
+        //    "lock" is `creator_lock_amount`, already handled above.
         let member_list_snapshot: Vec<Addr> = circle.members_list.clone();
         for member in &member_list_snapshot {
             let locked = MEMBER_LOCKED_AMOUNTS
                 .may_load(deps.storage, (circle_id, member.clone()))?
                 .unwrap_or(Uint128::zero());
-            let accumulated_fees = MEMBER_ACCUMULATED_LATE_FEES
-                .may_load(deps.storage, (circle_id, member.clone()))?
-                .unwrap_or(Uint128::zero());
-            let exit_penalty = compute_exit_penalty(locked, circle.exit_penalty_percent);
-            let deduction = accumulated_fees + exit_penalty;
-            let refund = if deduction >= locked {
-                Uint128::zero()
-            } else {
-                locked - deduction
-            };
-
-            if !refund.is_zero() {
-                let refund_msgs = safe_refund_or_queue(
-                    deps.branch(),
-                    &env,
+            if !locked.is_zero() {
+                credit_pending_payout(
+                    deps.storage,
                     circle_id,
                     member,
-                    refund,
-                    &circle.denomination,
+                    locked,
+                    &mut circle.total_pending_payouts,
                 )?;
-                messages.extend(refund_msgs);
+                debit_member_locked(
+                    deps.storage,
+                    circle_id,
+                    member,
+                    locked,
+                    &mut circle.total_amount_locked,
+                )?;
             }
-
-            debit_member_locked(
-                deps.storage,
-                circle_id,
-                member,
-                locked,
-                &mut circle.total_amount_locked,
-            )?;
             MEMBER_ACCUMULATED_LATE_FEES.remove(deps.storage, (circle_id, member.clone()));
+        }
+
+        // 3. Refund every deposit already made in the current (unfinished)
+        //    cycle. Without this the funds sit on the contract forever — the
+        //    cycle's payout will never happen, but `total_amount_locked` and
+        //    the bank balance still hold them. Crediting via PENDING_PAYOUTS
+        //    lets each depositor Withdraw the exact amount they put in.
+        //
+        //    DEPOSITS is keyed `(circle_id, member, cycle)`. The codebase
+        //    loads it by exact key per-member rather than iterating with
+        //    `prefix()`, so do the same here.
+        let unfinished_cycle = circle.current_cycle_index;
+        if unfinished_cycle > 0 {
+            for depositor in &member_list_snapshot {
+                let deposit_record = DEPOSITS.may_load(
+                    deps.storage,
+                    (circle_id, depositor.clone(), unfinished_cycle),
+                )?;
+                let amount = deposit_record.map(|r| r.amount).unwrap_or(Uint128::zero());
+                if amount.is_zero() {
+                    continue;
+                }
+                credit_pending_payout(
+                    deps.storage,
+                    circle_id,
+                    depositor,
+                    amount,
+                    &mut circle.total_pending_payouts,
+                )?;
+            }
         }
     } else {
         // Before start: refund all join deposits
@@ -2766,15 +3089,267 @@ fn execute_update_circle(
 // Withdraw Platform Fees (stub)
 // ---------------------------------------------------------------------------
 
+/// Send accumulated platform fees of a circle to the configured platform
+/// address. Permissionless — anyone may trigger because the destination is
+/// fixed in `PLATFORM_CONFIG`. Gated to `Finalizing` / `Completed` so a draw
+/// cannot happen while accounting is mid-cycle. Used to recover fees from
+/// legacy circles that finalized under the previous code path where fees were
+/// never drained.
 fn execute_withdraw_platform_fees(
-    _deps: DepsMut,
-    _env: Env,
-    _info: MessageInfo,
-    _circle_id: Option<u64>,
+    mut deps: DepsMut,
+    env: Env,
+    info: MessageInfo,
+    circle_id: Option<u64>,
 ) -> Result<Response, ContractError> {
-    Err(ContractError::InvalidParameters {
-        msg: "Platform fee withdrawal not yet implemented".to_string(),
-    })
+    let id = circle_id.ok_or_else(|| ContractError::InvalidParameters {
+        msg: "circle_id is required".to_string(),
+    })?;
+    let mut circle = CIRCLES.load(deps.storage, id)?;
+
+    if !matches!(
+        circle.circle_status,
+        CircleStatus::Finalizing | CircleStatus::Completed | CircleStatus::Cancelled
+    ) {
+        return Err(ContractError::InvalidCircleStatus {
+            expected: "Finalizing, Completed or Cancelled".to_string(),
+            actual: format!("{:?}", circle.circle_status),
+        });
+    }
+
+    let fees = circle.total_platform_fees_collected;
+    if fees.is_zero() {
+        return Err(ContractError::NoPendingPayouts {});
+    }
+
+    let platform_addr = PLATFORM_CONFIG.load(deps.storage)?.platform_address;
+    circle.total_platform_fees_collected = Uint128::zero();
+    circle.updated_at = env.block.time;
+    CIRCLES.save(deps.storage, id, &circle)?;
+
+    log_event(
+        &mut deps,
+        &env,
+        id,
+        "platform_fees_withdrawn",
+        &format!(
+            "{} usaf platform fees sent to {} (triggered by {})",
+            fees, platform_addr, info.sender
+        ),
+    )?;
+
+    Ok(Response::new()
+        .add_message(BankMsg::Send {
+            to_address: platform_addr.to_string(),
+            amount: vec![Coin {
+                denom: circle.denomination.clone(),
+                amount: fees,
+            }],
+        })
+        .add_attribute("action", "withdraw_platform_fees")
+        .add_attribute("circle_id", id.to_string())
+        .add_attribute("amount", fees.to_string()))
+}
+
+/// Sweep residual native funds on a Finalizing/Completed/Cancelled circle
+/// by crediting them to the CREATOR's `PENDING_PAYOUTS`, so the creator can
+/// reclaim them with a normal `Withdraw` call.
+///
+/// Permissionless. Only runs when every member has withdrawn
+/// (`total_pending_payouts == 0`).
+/// Residual = on-chain bank balance minus undrained platform fees
+/// (use `WithdrawPlatformFees` for those).
+///
+/// Use cases:
+/// - Legacy circles that finalized before the `members_at_start` fix in
+///   `total_rounds`: the contract zeroed `creator_lock_amount` but never
+///   credited the refund (e.g. an `Ws Savings Circle1` with 14 SAF stuck).
+///   This sweep delivers the funds to the creator.
+/// - Old residuals (truncated creator-lock refund, headroom remainder from
+///   over-deposits) — same recovery path.
+///
+/// If the creator is no longer addressable (somehow removed; shouldn't
+/// happen), the funds fall back to the platform address to avoid being
+/// permanently locked.
+fn execute_sweep_dust(
+    mut deps: DepsMut,
+    env: Env,
+    info: MessageInfo,
+    circle_id: u64,
+) -> Result<Response, ContractError> {
+    let mut circle = CIRCLES.load(deps.storage, circle_id)?;
+
+    if !matches!(
+        circle.circle_status,
+        CircleStatus::Finalizing | CircleStatus::Completed | CircleStatus::Cancelled
+    ) {
+        return Err(ContractError::InvalidCircleStatus {
+            expected: "Finalizing, Completed or Cancelled".to_string(),
+            actual: format!("{:?}", circle.circle_status),
+        });
+    }
+
+    if !circle.total_pending_payouts.is_zero() {
+        return Err(ContractError::InvalidParameters {
+            msg: format!(
+                "Pending payouts must be zero before sweep (still {})",
+                circle.total_pending_payouts
+            ),
+        });
+    }
+
+    let bal = deps
+        .querier
+        .query_balance(&env.contract.address, &circle.denomination)?;
+    // Reserve undrained platform fees - those go through WithdrawPlatformFees,
+    // not the dust path, so the platform address is not double-credited.
+    let dust = bal
+        .amount
+        .checked_sub(circle.total_platform_fees_collected)
+        .unwrap_or(Uint128::zero());
+
+    if dust.is_zero() {
+        return Err(ContractError::NoPendingPayouts {});
+    }
+
+    // Credit the residual to the CREATOR's pending payouts so they can
+    // reclaim it with a normal `Withdraw` call. This is the correct owner
+    // for stuck creator-lock refunds (the most common cause of dust).
+    //
+    // After this credit, `total_pending_payouts` is non-zero again - so the
+    // circle goes BACK to Finalizing (if it had flipped to Completed) until
+    // the creator's `Withdraw` zeroes it. Documented invariant preserved:
+    // Completed only when bank balance == 0.
+    credit_pending_payout(
+        deps.storage,
+        circle_id,
+        &circle.creator_address,
+        dust,
+        &mut circle.total_pending_payouts,
+    )?;
+    if circle.circle_status == CircleStatus::Completed {
+        // We just made the chain truth non-zero again; reflect that.
+        circle.circle_status = CircleStatus::Finalizing;
+    }
+    circle.updated_at = env.block.time;
+    CIRCLES.save(deps.storage, circle_id, &circle)?;
+
+    log_event(
+        &mut deps,
+        &env,
+        circle_id,
+        "dust_swept",
+        &format!(
+            "{} usaf residual credited to creator {} (triggered by {}); creator can now Withdraw",
+            dust, circle.creator_address, info.sender
+        ),
+    )?;
+
+    // No outbound BankMsg - the creator will pull the funds via Withdraw,
+    // which keeps `total_pending_payouts` accounting consistent.
+    Ok(Response::new()
+        .add_attribute("action", "sweep_dust")
+        .add_attribute("circle_id", circle_id.to_string())
+        .add_attribute("recipient", circle.creator_address.to_string())
+        .add_attribute("amount", dust.to_string()))
+}
+
+// ---------------------------------------------------------------------------
+// Deposit Creator Reward - platform sends X% of total volume to creator
+// ---------------------------------------------------------------------------
+
+/// Platform-funded reward for the creator, paid out of the platform / server
+/// wallet when a circle transitions to `Finalizing`. The caller attaches the
+/// reward amount as funds in the circle's denomination; the contract validates
+/// it, credits the creator's `PENDING_PAYOUTS`, and locks the per-circle
+/// idempotency flag so a duplicate broadcast cannot double-credit.
+///
+/// Design notes
+/// ------------
+///   - Permissionless: sending funds INTO the contract for someone else is
+///     harmless and lets any external party (DAO, partner, the server itself)
+///     boost a circle. The idempotency guard (CREATOR_REWARDS_CREDITED)
+///     prevents abuse.
+///   - Status gate is `Finalizing` (NOT Completed). At Finalizing the final
+///     round's PENDING_PAYOUTS are already credited; the creator's first
+///     `Withdraw` call after this credit will pick up both the round payout(s)
+///     AND the reward in one go. Pre-Finalizing the round flow hasn't run so
+///     the volume basis isn't fully known yet; post-Completed the bank should
+///     already be drained and adding to PENDING_PAYOUTS would resurrect the
+///     "Completed with non-zero balance" state we just fixed.
+///   - The reward is added to `total_pending_payouts` so the bank-vs-pending
+///     invariant on Withdraw stays consistent: the funds we just received
+///     are immediately backed by an equal pending credit.
+fn execute_deposit_creator_reward(
+    mut deps: DepsMut,
+    env: Env,
+    info: MessageInfo,
+    circle_id: u64,
+) -> Result<Response, ContractError> {
+    let mut circle = CIRCLES.load(deps.storage, circle_id)?;
+
+    // Status gate: only at Finalizing. See doc-comment above.
+    if !matches!(circle.circle_status, CircleStatus::Finalizing) {
+        return Err(ContractError::InvalidCircleStatus {
+            expected: "Finalizing".to_string(),
+            actual: format!("{:?}", circle.circle_status),
+        });
+    }
+
+    // Idempotency: refuse a second reward credit for the same circle.
+    if CREATOR_REWARDS_CREDITED
+        .may_load(deps.storage, circle_id)?
+        .is_some()
+    {
+        return Err(ContractError::InvalidParameters {
+            msg: "Creator reward already credited for this circle".to_string(),
+        });
+    }
+
+    // Pull attached funds in the circle's denomination.
+    let amount = must_pay(&info, &circle.denomination).map_err(|_| {
+        ContractError::InsufficientFunds {
+            required: "non-zero reward in circle denomination".to_string(),
+            sent: "0".to_string(),
+        }
+    })?;
+    if amount.is_zero() {
+        return Err(ContractError::InsufficientFunds {
+            required: "non-zero reward".to_string(),
+            sent: "0".to_string(),
+        });
+    }
+
+    // Credit the creator's pending payouts. They will pick this up via the
+    // existing `Withdraw` flow alongside any final-round payouts.
+    credit_pending_payout(
+        deps.storage,
+        circle_id,
+        &circle.creator_address,
+        amount,
+        &mut circle.total_pending_payouts,
+    )?;
+
+    CREATOR_REWARDS_CREDITED.save(deps.storage, circle_id, &amount)?;
+    circle.updated_at = env.block.time;
+    CIRCLES.save(deps.storage, circle_id, &circle)?;
+
+    log_event(
+        &mut deps,
+        &env,
+        circle_id,
+        "creator_reward_credited",
+        &format!(
+            "{} usaf reward credited to creator {} by {}",
+            amount, circle.creator_address, info.sender
+        ),
+    )?;
+
+    Ok(Response::new()
+        .add_attribute("action", "deposit_creator_reward")
+        .add_attribute("circle_id", circle_id.to_string())
+        .add_attribute("creator", circle.creator_address.to_string())
+        .add_attribute("amount", amount.to_string())
+        .add_attribute("funder", info.sender.to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -3103,9 +3678,22 @@ fn generate_payout_order(circle: &mut Circle, env: &Env) {
 }
 
 fn build_distribution_calendar(circle: &Circle, start_timestamp: Timestamp) -> String {
+    // Mirror `distribution_min_round_for_active` (and the matching helper in
+    // query.rs) so the emitted calendar matches the execute path. Diverging
+    // from execute previously broke the cron classifier — and showed phantom
+    // distribution rounds when `max_members` exceeded the actual roster
+    // (round_size was max_members, so round_in_cycle could legitimately reach
+    // it on cycle 2+ for a not-yet-full circle).
+    //
+    // Both the modulo (round_size) and the distribution gate must use the
+    // payout-order length — locked at start to the active roster size.
+    let round_size = circle.payout_order_list
+        .as_ref()
+        .map(|l| l.len() as u32)
+        .unwrap_or(circle.max_members)
+        .max(1);
     let min_round_for_distribution: u32 = match circle.distribution_threshold {
-        None => 1,
-        Some(DistributionThreshold::Total {}) => circle.max_members,
+        None | Some(DistributionThreshold::Total {}) => round_size,
         Some(DistributionThreshold::MinMembers { count }) => count,
     };
 
@@ -3114,7 +3702,7 @@ fn build_distribution_calendar(circle: &Circle, start_timestamp: Timestamp) -> S
         let mut round_number = 1u32;
         for cycle in 1..=circle.total_cycles {
             for recipient in payout_order.iter() {
-                let round_in_cycle = ((round_number - 1) % circle.max_members) + 1;
+                let round_in_cycle = ((round_number - 1) % round_size) + 1;
                 let distribution_occurs = round_in_cycle >= min_round_for_distribution;
                 let round_offset_seconds = (round_number - 1) as u64 * circle.cycle_duration_secs();
                 let deposit_deadline = Timestamp::from_seconds(
@@ -3328,6 +3916,7 @@ mod tests {
             min_members_required: 2,
             invite_only: false,
             contribution_amount: Uint128::from(100u128),
+            denomination: None,
             exit_penalty_percent: 2000,
             late_fee_percent: 1000,
             total_cycles: 2,
@@ -3401,6 +3990,7 @@ mod tests {
             min_members_required: 2,
             invite_only: false,
             contribution_amount: Uint128::from(100u128),
+            denomination: None,
             exit_penalty_percent: 2000,
             late_fee_percent: 1000,
             total_cycles: 2,
@@ -3457,6 +4047,7 @@ mod tests {
             min_members_required: 2,
             invite_only: false,
             contribution_amount: Uint128::from(100u128),
+            denomination: None,
             exit_penalty_percent: 2000,
             late_fee_percent: 1000,
             total_cycles: 2,

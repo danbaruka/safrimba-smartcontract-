@@ -8,9 +8,17 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
-# Check for migrate mode: ./deploy.sh migrate <network> <contract_address> [code_id] [key_name]
-# If code_id is provided, skip build/upload and use it. Otherwise build, upload, then migrate.
-# key_name: optional - must be the contract admin's key (default: mywallet)
+# ─────────────────────────────────────────────────────────────────────────────
+# Modes
+# ─────────────────────────────────────────────────────────────────────────────
+# 1) Fresh deploy (new code id, existing contracts untouched — only the
+#    frontend env is updated so new instances use the new code id)
+#       ./deploy.sh [testnet|mainnet] [key_name] [admin_address]
+#
+# 2) Migrate ONE contract (build + upload + migrate that address, OR migrate
+#    to an already-uploaded code id):
+#       ./deploy.sh migrate [testnet|mainnet] <contract_address> [code_id] [key_name]
+# ─────────────────────────────────────────────────────────────────────────────
 MIGRATE_MODE=false
 CONTRACT_TO_MIGRATE=""
 USE_EXISTING_CODE_ID=""
@@ -38,23 +46,38 @@ fi
 
 # Default values
 NETWORK="${NETWORK:-${1:-testnet}}"
-if [[ "$MIGRATE_MODE" != "true" ]]; then
-    # Normal deploy: $1=network, $2=key_name, $3=admin_address
-    KEY_NAME="${2:-mywallet}"
-    ADMIN_ADDRESS="${3:-addr_safro1f8a9m8r5dq046qvmm9h5eryk0fn0u7tqu6v6sn}"
-else
+if [[ "$MIGRATE_MODE" == "true" ]]; then
     # Migrate: $1=network, $2=contract_address, $3=code_id, $4=key_name
     KEY_NAME="${MIGRATE_KEY_NAME:-mywallet}"
     ADMIN_ADDRESS="addr_safro1f8a9m8r5dq046qvmm9h5eryk0fn0u7tqu6v6sn"
+else
+    # Normal deploy: $1=network, $2=key_name, $3=admin_address
+    KEY_NAME="${2:-mywallet}"
+    ADMIN_ADDRESS="${3:-addr_safro1f8a9m8r5dq046qvmm9h5eryk0fn0u7tqu6v6sn}"
 fi
 PLATFORM_FEE_PERCENT="${4:-100}"  # 1% in basis points
 PLATFORM_ADDRESS="${5:-$ADMIN_ADDRESS}"
 
+# Keyring backend selection. cosmos-sdk defaults to `os` (macOS Keychain)
+# which is fragile — corrupted entries or a missing passphrase cause every
+# `safrochaind keys|tx` call to exit silently. Honor an explicit env override
+# so users on a clean `test`/`file` keyring don't have to babysit Keychain.
+#
+#   KEYRING_BACKEND=test ./scripts/deploy.sh testnet
+#   KEYRING_BACKEND=file ./scripts/deploy.sh testnet
+#
+# Every safrochaind call below threads `$KEYRING_OPTS` so the choice is honored
+# at both `keys show` time AND `tx wasm store` time (the historic skew between
+# the two is what made the script appear to "hang" at step 3).
+KEYRING_BACKEND="${KEYRING_BACKEND:-os}"
+KEYRING_OPTS="--keyring-backend $KEYRING_BACKEND"
+
 # Validate network
 if [[ "$NETWORK" != "testnet" && "$NETWORK" != "mainnet" ]]; then
     echo -e "${RED}Error: Network must be 'testnet' or 'mainnet'${NC}"
-    echo "Usage: $0 [testnet|mainnet] [key_name] [admin_address] [platform_fee_percent] [platform_address]"
-    echo "   or: $0 migrate [testnet|mainnet] <contract_address> [code_id]"
+    echo "Usage:"
+    echo "  $0 [testnet|mainnet] [key_name] [admin_address]                # fresh deploy (new code id)"
+    echo "  $0 migrate [testnet|mainnet] <contract_address> [code_id]      # migrate ONE contract"
     exit 1
 fi
 
@@ -101,31 +124,42 @@ if ! command -v jq &> /dev/null; then
     exit 1
 fi
 
-# Check if key exists
-if ! safrochaind keys show "$KEY_NAME" &> /dev/null; then
-    echo -e "${YELLOW}Warning: Key '$KEY_NAME' not found in keyring.${NC}"
-    echo -e "${YELLOW}Attempting to use address directly: $ADMIN_ADDRESS${NC}"
-    USE_ADDRESS=true
-    KEY_ADDRESS="$ADMIN_ADDRESS"
-    
-    # Verify the address format
-    if [[ ! "$KEY_ADDRESS" =~ ^addr_safro ]]; then
-        echo -e "${RED}Error: Invalid address format: $KEY_ADDRESS${NC}"
-        echo -e "${YELLOW}Safrochain addresses should start with 'addr_safro'${NC}"
-        exit 1
-    fi
-else
-    USE_ADDRESS=false
-    KEY_ADDRESS=$(safrochaind keys show "$KEY_NAME" -a)
-    echo -e "Key Address: ${YELLOW}$KEY_ADDRESS${NC}"
-    
-    # Verify key can be used for transactions
-    echo -e "${YELLOW}Verifying key can be used for transactions...${NC}"
-    if ! safrochaind keys show "$KEY_NAME" &>/dev/null; then
-        echo -e "${RED}Error: Key '$KEY_NAME' exists but cannot be accessed${NC}"
-        echo -e "${YELLOW}Please check your keyring configuration${NC}"
-        exit 1
-    fi
+echo -e "Keyring backend: ${YELLOW}$KEYRING_BACKEND${NC}"
+
+# Resolve key from the chosen keyring backend. `safrochaind tx` REQUIRES a
+# signing key in the keyring — passing `--from <bech32-address>` does not
+# sign anything (the SDK ignores it for tx purposes), which is why the
+# previous "use address directly" branch silently failed at upload time.
+# We bail out early with explicit remediation instead.
+KEY_SHOW_OUTPUT=$(safrochaind keys show "$KEY_NAME" $KEYRING_OPTS -a 2>&1)
+KEY_SHOW_EXIT=$?
+if [[ $KEY_SHOW_EXIT -ne 0 || -z "$KEY_SHOW_OUTPUT" || ! "$KEY_SHOW_OUTPUT" =~ ^addr_safro ]]; then
+    echo -e "${RED}Error: Key '$KEY_NAME' not usable in keyring backend '$KEYRING_BACKEND'.${NC}"
+    echo -e "${YELLOW}safrochaind keys show output:${NC}"
+    echo "$KEY_SHOW_OUTPUT" | sed 's/^/  /'
+    echo ""
+    echo -e "${YELLOW}Fix options:${NC}"
+    echo -e "  1. Use a different backend (recommended on macOS if Keychain is wedged):"
+    echo -e "       ${GREEN}KEYRING_BACKEND=test ./scripts/deploy.sh $NETWORK${NC}"
+    echo -e "       ${GREEN}KEYRING_BACKEND=file ./scripts/deploy.sh $NETWORK${NC}"
+    echo -e "  2. List which keys you actually have in that backend:"
+    echo -e "       ${GREEN}safrochaind keys list --keyring-backend $KEYRING_BACKEND${NC}"
+    echo -e "  3. Import the deployment key (if you have its mnemonic):"
+    echo -e "       ${GREEN}safrochaind keys add $KEY_NAME --recover --keyring-backend $KEYRING_BACKEND${NC}"
+    echo -e "  4. Override the key name if it lives under a different alias:"
+    echo -e "       ${GREEN}./scripts/deploy.sh $NETWORK <existing_key_name>${NC}"
+    exit 1
+fi
+KEY_ADDRESS="$KEY_SHOW_OUTPUT"
+echo -e "Key Address: ${YELLOW}$KEY_ADDRESS${NC}"
+
+# Sanity: the resolved key must match the admin address baked into deployment-testnet.json
+# (otherwise the migrate-mode step would fail later because the admin signer differs).
+if [[ "$KEY_ADDRESS" != "$ADMIN_ADDRESS" ]]; then
+    echo -e "${YELLOW}Warning: Resolved key address differs from configured ADMIN_ADDRESS.${NC}"
+    echo -e "  ${YELLOW}Key '$KEY_NAME' → $KEY_ADDRESS${NC}"
+    echo -e "  ${YELLOW}ADMIN_ADDRESS    → $ADMIN_ADDRESS${NC}"
+    echo -e "  ${YELLOW}Uploads still work, but any future 'migrate' against contracts admin-locked to $ADMIN_ADDRESS will fail.${NC}"
 fi
 
 # Check account balance
@@ -196,14 +230,13 @@ fi
 DENOM="$FEE_DENOM"
 echo -e "Using denomination for fees: ${YELLOW}${DENOM}${NC}"
 
-# --- MIGRATE MODE: with existing code ID, skip build/upload ---
+# --- MIGRATE MODE with existing code ID: skip build/upload ---
 if [[ "$MIGRATE_MODE" == "true" && -n "$USE_EXISTING_CODE_ID" ]]; then
     CODE_ID="$USE_EXISTING_CODE_ID"
     echo -e "\n${GREEN}=== Migrate Mode (using existing code ID $CODE_ID) ===${NC}"
     echo -e "Contract to migrate: ${YELLOW}$CONTRACT_TO_MIGRATE${NC}"
     echo -e "New code ID: ${YELLOW}$CODE_ID${NC}"
     echo -e "Network: ${YELLOW}$NETWORK${NC}"
-    # Skip to migrate step (after the upload section)
     SKIP_BUILD_UPLOAD=true
 else
     SKIP_BUILD_UPLOAD=false
@@ -304,7 +337,7 @@ echo -e "${GREEN}RPC connection OK${NC}"
 # Use gas-prices instead of fixed fees (chain calculates fees automatically)
 GAS_PRICE="0.025${DENOM}"
 
-echo -e "Running: safrochaind tx wasm store $OPTIMIZED_WASM --from $KEY_NAME --chain-id $CHAIN_ID --node $RPC_URL --broadcast-mode sync --gas auto --gas-adjustment 1.4 --gas-prices $GAS_PRICE -y"
+echo -e "Running: safrochaind tx wasm store $OPTIMIZED_WASM --from $KEY_NAME $KEYRING_OPTS --chain-id $CHAIN_ID --node $RPC_URL --broadcast-mode sync --gas auto --gas-adjustment 1.4 --gas-prices $GAS_PRICE -y"
 echo ""
 
 # Capture both stdout and stderr with timeout
@@ -319,6 +352,7 @@ fi
 if [[ -n "$UPLOAD_TIMEOUT" ]]; then
     UPLOAD_OUTPUT=$($UPLOAD_TIMEOUT safrochaind tx wasm store "$OPTIMIZED_WASM" \
         --from "$KEY_NAME" \
+        $KEYRING_OPTS \
         --chain-id "$CHAIN_ID" \
         --node "$RPC_URL" \
         --broadcast-mode sync \
@@ -328,7 +362,7 @@ if [[ -n "$UPLOAD_TIMEOUT" ]]; then
         -y \
         --output json 2>&1)
     UPLOAD_EXIT_CODE=$?
-    
+
     # Check if timeout occurred
     if [[ $UPLOAD_EXIT_CODE -eq 124 ]]; then
         echo -e "${RED}Error: Command timed out after 60 seconds${NC}"
@@ -340,6 +374,7 @@ else
     # Fallback if timeout command is not available
     UPLOAD_OUTPUT=$(safrochaind tx wasm store "$OPTIMIZED_WASM" \
         --from "$KEY_NAME" \
+        $KEYRING_OPTS \
         --chain-id "$CHAIN_ID" \
         --node "$RPC_URL" \
         --broadcast-mode sync \
@@ -372,6 +407,7 @@ if [[ -z "$UPLOAD_OUTPUT" || "$UPLOAD_OUTPUT" == "" ]]; then
     # Try running without capture to see what happens
     safrochaind tx wasm store "$OPTIMIZED_WASM" \
         --from "$KEY_NAME" \
+        $KEYRING_OPTS \
         --chain-id "$CHAIN_ID" \
         --node "$RPC_URL" \
         --broadcast-mode sync \
@@ -401,7 +437,7 @@ if [[ $UPLOAD_EXIT_CODE -ne 0 ]]; then
     if echo "$UPLOAD_OUTPUT" | grep -qi "key not found\|no such key"; then
         echo -e "${YELLOW}Key '$KEY_NAME' not found in keyring${NC}"
         echo -e "${YELLOW}Available keys:${NC}"
-        safrochaind keys list 2>/dev/null || echo "  (Could not list keys)"
+        safrochaind keys list $KEYRING_OPTS 2>/dev/null || echo "  (Could not list keys)"
     fi
     if echo "$UPLOAD_OUTPUT" | grep -qi "account.*not found"; then
         echo -e "${YELLOW}Account not found. Please fund your account first.${NC}"
@@ -572,11 +608,12 @@ if [[ "$MIGRATE_MODE" == "true" && -n "$CONTRACT_TO_MIGRATE" ]]; then
     echo -e "\n${GREEN}=== Migrating contract to new code ===${NC}"
     echo -e "Contract: ${YELLOW}$CONTRACT_TO_MIGRATE${NC}"
     echo -e "New code ID: ${YELLOW}$CODE_ID${NC}"
-    echo -e "Running: safrochaind tx wasm migrate $CONTRACT_TO_MIGRATE $CODE_ID '{}' --from $KEY_NAME --chain-id $CHAIN_ID --node $RPC_URL --gas auto --gas-adjustment 1.4 --gas-prices $GAS_PRICE -y"
+    echo -e "Running: safrochaind tx wasm migrate $CONTRACT_TO_MIGRATE $CODE_ID '{}' --from $KEY_NAME $KEYRING_OPTS --chain-id $CHAIN_ID --node $RPC_URL --gas auto --gas-adjustment 1.4 --gas-prices $GAS_PRICE -y"
     echo ""
-    
+
     MIGRATE_OUTPUT=$(safrochaind tx wasm migrate "$CONTRACT_TO_MIGRATE" "$CODE_ID" '{}' \
         --from "$KEY_NAME" \
+        $KEYRING_OPTS \
         --chain-id "$CHAIN_ID" \
         --node "$RPC_URL" \
         --gas auto \
@@ -641,7 +678,9 @@ if [[ "$MIGRATE_MODE" == "true" && -n "$CONTRACT_TO_MIGRATE" ]]; then
     fi
 fi
 
-# Skip config update in migrate-only mode (when we used existing code ID)
+# If the user supplied an existing code ID and only asked to migrate, exit
+# without touching the frontend config (codeId already reflects whatever they
+# explicitly chose).
 if [[ "$MIGRATE_MODE" == "true" && "$SKIP_BUILD_UPLOAD" == "true" ]]; then
     echo -e "\n${GREEN}Done.${NC}"
     exit 0
@@ -758,6 +797,7 @@ echo -e "Code ID: ${GREEN}$CODE_ID${NC}"
 echo -e "Admin Address: ${YELLOW}$ADMIN_ADDRESS${NC}"
 echo -e "Platform Fee: ${YELLOW}$PLATFORM_FEE_PERCENT${NC} basis points (1% = 100)"
 echo -e "\n${GREEN}Contract code uploaded successfully!${NC}"
-echo -e "${YELLOW}The frontend will instantiate new contract instances for each circle.${NC}"
+echo -e "${YELLOW}Existing circles are NOT migrated. To upgrade one, run:${NC}"
+echo -e "  ${YELLOW}./scripts/deploy.sh migrate $NETWORK <contract_address> $CODE_ID${NC}"
 echo -e "Frontend .env file updated: ${YELLOW}$ENV_LOCAL_FILE${NC}"
 

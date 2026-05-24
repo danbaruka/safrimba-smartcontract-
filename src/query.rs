@@ -126,9 +126,15 @@ pub fn query_payouts(deps: Deps, _env: Env, circle_id: u64) -> StdResult<Payouts
     let circle = CIRCLES.load(deps.storage, circle_id)?;
     let mut payouts = vec![];
 
-    for cycle in 1..=circle.cycles_completed {
+    // `PAYOUTS` is keyed by `current_cycle_index` (the round counter), not by
+    // calendar cycle. Iterating `1..=cycles_completed` therefore missed payouts
+    // recorded outside that window (e.g. the per-round payouts that happen
+    // when distribution_threshold = None / Total at the last round of a cycle).
+    // Iterate by round instead so every PAYOUT row is returned.
+    let last_round = circle.current_cycle_index;
+    for round in 1..=last_round {
         for item in PAYOUTS
-            .prefix((circle_id, cycle))
+            .prefix((circle_id, round))
             .range(deps.storage, None, None, Order::Ascending)
         {
             let (_, payout) = item?;
@@ -574,25 +580,55 @@ pub fn query_distribution_calendar(
         cosmwasm_std::StdError::generic_err("Circle has not started yet")
     })?;
     
-    // When the first distribution happens:
-    // - None => round 1 (distribution every round)
-    // - Total => 100% of all members (distribution at end of each cycle only)
+    // Threshold semantics — kept in lockstep with
+    // `distribution_min_round_for_active` in execute.rs. Diverging from execute
+    // caused the cron to queue the wrong action and round to get stuck.
+    //
+    // - None     => same as Total: distribution at the last round of each cycle
+    // - Total    => 100% of all members (distribution at end of each cycle only)
     // - MinMembers(N) => distribution from round N onward (within each cycle)
+    //
+    // For Total/None, the "last round" is determined by the PAYOUT ORDER size
+    // (= members locked-in at start), NOT `max_members` — a 3-cap circle that
+    // started with 2 has 2-round cycles. Using `max_members` here marked no
+    // round as a distribution round (round_in_cycle maxes at 2, never reaches 3),
+    // which removed every distribution from the calendar.
+    let round_size = circle.payout_order_list
+        .as_ref()
+        .map(|l| l.len() as u32)
+        .unwrap_or(circle.max_members)
+        .max(1);
     let min_round_for_distribution: u32 = match circle.distribution_threshold {
-        None => 1,
-        Some(DistributionThreshold::Total {}) => circle.max_members,
+        None | Some(DistributionThreshold::Total {}) => round_size,
         Some(DistributionThreshold::MinMembers { count }) => count,
     };
     
     let mut rounds = vec![];
-    
+
+    // Pre-load blocked members so we can mark ejected recipients in the
+    // calendar. A member is blocked at cycle `bc`; we mark the calendar slot
+    // recipient as None for rounds whose cycle_number > bc (i.e. the member
+    // was already ejected before this slot was due) so the UI can render
+    // "Ejected" instead of the original name and avoid implying a payout
+    // that will never happen.
+    let blocked: Vec<(Addr, u32)> = BLOCKED_MEMBERS
+        .prefix(circle_id)
+        .range(deps.storage, None, None, Order::Ascending)
+        .filter_map(|r| r.ok())
+        .collect();
+
     if let Some(payout_order) = &circle.payout_order_list {
+        // Round size for the cycle modulo is the number of recipients in the
+        // payout order — same value used by `execute` for round_in_cycle —
+        // not max_members. With check_and_eject shrinking the list, this
+        // keeps the calendar consistent with the contract's own bookkeeping.
+        let round_size = payout_order.len().max(1) as u32;
         let mut round_number = 1u32;
         for cycle in 1..=circle.total_cycles {
             for recipient in payout_order.iter() {
-                let round_in_cycle = ((round_number - 1) % circle.max_members) + 1;
+                let round_in_cycle = ((round_number - 1) % round_size) + 1;
                 let distribution_occurs = round_in_cycle >= min_round_for_distribution;
-                
+
                 let round_offset_seconds = (round_number - 1) as u64 * circle.cycle_duration_secs();
                 let deposit_deadline = Timestamp::from_seconds(
                     start_timestamp.seconds() + round_offset_seconds
@@ -600,21 +636,27 @@ pub fn query_distribution_calendar(
                 let distribution_date = Timestamp::from_seconds(
                     start_timestamp.seconds() + round_offset_seconds + circle.cycle_duration_secs()
                 );
-                
+
+                // Was this recipient ejected before this cycle?
+                let recipient_field = match blocked.iter().find(|(addr, _)| addr == recipient) {
+                    Some((_, bc)) if cycle > *bc => None, // ejected before this slot
+                    _ => Some(recipient.clone()),
+                };
+
                 rounds.push(CalendarRound {
                     round_number,
                     cycle_number: cycle,
                     deposit_deadline,
                     distribution_date,
                     distribution_occurs,
-                    recipient: Some(recipient.clone()),
+                    recipient: recipient_field,
                 });
-                
+
                 round_number += 1;
             }
         }
     }
-    
+
     Ok(DistributionCalendarResponse {
         rounds,
     })

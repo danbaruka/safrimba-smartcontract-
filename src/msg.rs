@@ -27,6 +27,13 @@ pub enum ExecuteMsg {
         min_members_required: u32,
         invite_only: bool,
         contribution_amount: Uint128,
+        /// Token used for all financial operations in this circle (creator lock, deposits,
+        /// payouts, refunds). Allow-list: `"usaf"` (native SAF, 6 decimals) or the
+        /// Noble IBC USDC trace on Safrochain
+        /// (`ibc/2180E84E20F5679FCC760D8C165B60F42065DEF7F46A72B447CFF1B7DC6C0A65`, 6 decimals).
+        /// When omitted, defaults to `"usaf"` for backward compatibility.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        denomination: Option<String>,
         /// Exit penalty in basis points of locked amount (e.g. 2000 = 20%)
         exit_penalty_percent: u64,
         /// Late fee per missed round, in basis points of contribution_amount (e.g. 1000 = 10%)
@@ -122,6 +129,24 @@ pub enum ExecuteMsg {
     },
     WithdrawPlatformFees {
         circle_id: Option<u64>,
+    },
+    /// Permissionless. Send residual native funds on a `Finalizing` / `Completed`
+    /// circle to the platform address (after all members have withdrawn).
+    /// Used to recover stuck dust from legacy circles whose finalization ran
+    /// before the platform-fee auto-drain fix.
+    SweepDust {
+        circle_id: u64,
+    },
+    /// Platform-funded creator reward. The caller (typically the platform
+    /// server wallet) attaches the reward amount as funds in the circle's
+    /// denomination; the contract credits it to the creator's PENDING_PAYOUTS
+    /// so they receive it via the normal `Withdraw` flow. Permissionless by
+    /// design - sending funds INTO the contract for someone else is harmless;
+    /// idempotency is enforced via per-circle state so a duplicate broadcast
+    /// returns an error rather than crediting twice. Intended to be called
+    /// when a circle transitions to `Finalizing`.
+    DepositCreatorReward {
+        circle_id: u64,
     },
     // Private Circle and Member Management
     AddPrivateMember {
