@@ -342,53 +342,72 @@ echo -e "${GREEN}RPC connection OK${NC}"
 # Use gas-prices instead of fixed fees (chain calculates fees automatically)
 GAS_PRICE="0.025${DENOM}"
 
-echo -e "Running: safrochaind tx wasm store $OPTIMIZED_WASM --from $KEY_NAME $KEYRING_OPTS --chain-id $CHAIN_ID --node $RPC_URL --broadcast-mode sync --gas auto --gas-adjustment 1.4 --gas-prices $GAS_PRICE -y"
-echo ""
-
-# Capture both stdout and stderr with timeout
-# Use timeout to prevent hanging (60 seconds should be enough)
-# Portable timeout: gtimeout (macOS), timeout (Linux), or no-timeout fallback
+# Upload in three explicit steps. The one-shot online path (`tx wasm store -y`)
+# can sign with account number 0 against Safrochain's public nodes, which
+# reject it: "signature verification failed; please verify account number (0)".
+# So: generate (gas simulated online), sign OFFLINE with the account number and
+# sequence read from the chain, then broadcast the signed bytes.
 UPLOAD_TIMEOUT=""
 if command -v gtimeout &> /dev/null; then
-    UPLOAD_TIMEOUT="gtimeout 60"
+    UPLOAD_TIMEOUT="gtimeout 120"
 elif command -v timeout &> /dev/null; then
-    UPLOAD_TIMEOUT="timeout 60"
+    UPLOAD_TIMEOUT="timeout 120"
 fi
-if [[ -n "$UPLOAD_TIMEOUT" ]]; then
-    UPLOAD_OUTPUT=$($UPLOAD_TIMEOUT safrochaind tx wasm store "$OPTIMIZED_WASM" \
+STORE_TMP="$(mktemp -d)"
+ACCOUNT_JSON=$(safrochaind query auth account "$KEY_ADDRESS" --node "$RPC_URL" --output json 2>/dev/null || true)
+ACCOUNT_NUMBER=$(echo "$ACCOUNT_JSON" | jq -r '.account.value.account_number // .account.account_number // empty' 2>/dev/null)
+ACCOUNT_SEQUENCE=$(echo "$ACCOUNT_JSON" | jq -r '.account.value.sequence // .account.sequence // "0"' 2>/dev/null)
+if [[ -z "$ACCOUNT_NUMBER" ]]; then
+    echo -e "${RED}Error: could not read the account number of $KEY_ADDRESS on $RPC_URL${NC}"
+    exit 1
+fi
+echo -e "Account: number ${YELLOW}$ACCOUNT_NUMBER${NC}, sequence ${YELLOW}$ACCOUNT_SEQUENCE${NC}"
+echo -e "Generating store tx (gas auto x1.4, $GAS_PRICE)..."
+if ! $UPLOAD_TIMEOUT safrochaind tx wasm store "$OPTIMIZED_WASM" \
         --from "$KEY_NAME" \
         $KEYRING_OPTS \
         --chain-id "$CHAIN_ID" \
         --node "$RPC_URL" \
-        --broadcast-mode sync \
         --gas auto \
         --gas-adjustment 1.4 \
         --gas-prices "$GAS_PRICE" \
-        -y \
-        --output json 2>&1)
-    UPLOAD_EXIT_CODE=$?
-
-    # Check if timeout occurred
-    if [[ $UPLOAD_EXIT_CODE -eq 124 ]]; then
-        echo -e "${RED}Error: Command timed out after 60 seconds${NC}"
-        echo -e "${YELLOW}The transaction may still be processing. Check manually with:${NC}"
-        echo -e "  ${YELLOW}safrochaind query wasm list-code --node $RPC_URL --limit 5${NC}"
-        exit 1
-    fi
-else
-    # Fallback if timeout command is not available
-    UPLOAD_OUTPUT=$(safrochaind tx wasm store "$OPTIMIZED_WASM" \
+        --generate-only \
+        --output json > "$STORE_TMP/unsigned.json" 2> "$STORE_TMP/generate.err"; then
+    echo -e "${RED}Error generating the store transaction:${NC}"
+    cat "$STORE_TMP/generate.err"
+    exit 1
+fi
+echo -e "Signing offline (account number $ACCOUNT_NUMBER, sequence $ACCOUNT_SEQUENCE, sign mode direct)..."
+if ! $UPLOAD_TIMEOUT safrochaind tx sign "$STORE_TMP/unsigned.json" \
         --from "$KEY_NAME" \
         $KEYRING_OPTS \
         --chain-id "$CHAIN_ID" \
-        --node "$RPC_URL" \
-        --broadcast-mode sync \
-        --gas auto \
-        --gas-adjustment 1.4 \
-        --gas-prices "$GAS_PRICE" \
-        -y \
-        --output json 2>&1)
-    UPLOAD_EXIT_CODE=$?
+        --offline \
+        --account-number "$ACCOUNT_NUMBER" \
+        --sequence "$ACCOUNT_SEQUENCE" \
+        --sign-mode direct \
+        --output-document "$STORE_TMP/signed.json" < /dev/null 2> "$STORE_TMP/sign.err"; then
+    echo -e "${RED}Error signing the store transaction:${NC}"
+    cat "$STORE_TMP/sign.err"
+    exit 1
+fi
+echo -e "Broadcasting..."
+UPLOAD_OUTPUT=$($UPLOAD_TIMEOUT safrochaind tx broadcast "$STORE_TMP/signed.json" \
+    --node "$RPC_URL" \
+    --broadcast-mode sync \
+    --output json 2>&1)
+UPLOAD_EXIT_CODE=$?
+rm -rf "$STORE_TMP"
+if [[ $UPLOAD_EXIT_CODE -eq 124 ]]; then
+    echo -e "${RED}Error: broadcast timed out${NC}"
+    echo -e "${YELLOW}The transaction may still be processing. Check manually with:${NC}"
+    echo -e "  ${YELLOW}safrochaind query wasm list-code --node $RPC_URL --limit 5${NC}"
+    exit 1
+fi
+if echo "$UPLOAD_OUTPUT" | jq -e '.code != 0' >/dev/null 2>&1; then
+    echo -e "${RED}Error: the chain rejected the store transaction:${NC}"
+    echo "$UPLOAD_OUTPUT" | jq -r '.raw_log' 2>/dev/null || echo "$UPLOAD_OUTPUT"
+    exit 1
 fi
 
 # Always show the output for debugging
@@ -405,25 +424,10 @@ if [[ -z "$UPLOAD_OUTPUT" || "$UPLOAD_OUTPUT" == "" ]]; then
     echo -e "  - Key not found or incorrect"
     echo -e "  - Command is hanging"
     echo ""
-    echo -e "Trying to run command without output capture to debug..."
-    echo -e "${YELLOW}If this hangs, press Ctrl+C and check your connection${NC}"
-    echo ""
-    
-    # Try running without capture to see what happens
-    safrochaind tx wasm store "$OPTIMIZED_WASM" \
-        --from "$KEY_NAME" \
-        $KEYRING_OPTS \
-        --chain-id "$CHAIN_ID" \
-        --node "$RPC_URL" \
-        --broadcast-mode sync \
-        --gas auto \
-        --gas-adjustment 1.4 \
-        --gas-prices "$GAS_PRICE" \
-        -y \
-        --output json
-    
-    echo ""
-    echo -e "${YELLOW}If you see output above, the command works but output capture failed.${NC}"
+    # Never re-broadcast here: a silent first attempt may still land on chain,
+    # and a second upload would create a duplicate code id.
+    echo -e "${YELLOW}Check whether a code was stored before retrying:${NC}"
+    echo -e "  ${YELLOW}safrochaind query wasm list-code --node $RPC_URL --reverse --limit 3${NC}"
     echo -e "${YELLOW}Please run the deployment manually or check the script.${NC}"
     exit 1
 fi

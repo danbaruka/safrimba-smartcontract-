@@ -51,5 +51,6 @@
   ],
   "features": [],
   "isTestnet": true,
-  "codeId": 179
+  "codeId": 184,
+  "codeApiVersion": 5
 }

@@ -1,12 +1,17 @@
 {
   "network": "testnet",
   "chainId": "safro-testnet-1",
-  "codeId": "179",
+  "codeId": "184",
+  "apiVersion": 5,
+  "contractVersion": "0.5.1",
+  "wasmSha256": "4d836fd64a61d3998be7798472bad4d9e9da4f815d4bf73f43a4acb8cdaeef7d",
   "adminAddress": "addr_safro1f8a9m8r5dq046qvmm9h5eryk0fn0u7tqu6v6sn",
-  "platformFeePercent": 100,
+  "platformFeePercent": 0,
   "platformAddress": "addr_safro1f8a9m8r5dq046qvmm9h5eryk0fn0u7tqu6v6sn",
-  "deployedAt": "2026-08-15T07:15:00Z",
-  "storeTx": "4BFCF31E1B6450805B313DD43AFEC21DB369D0F0D71441A9CAD2DB312095704D",
+  "deployedAt": "2026-11-08T11:48:00Z",
+  "storeTx": "C48EA718088B95B34E176D65A3522745FDEBF52FC85F0DDF82222A971671BA1E",
+  "storeHeight": "16673585",
   "wasmFile": "safrimba_contract.wasm",
-  "note": "Contract instances will be created by the frontend for each circle"
+  "previousCodeId": "179",
+  "note": "Engine v5 0.5.1 (PLAN_V5 P0). Circles are instantiated by the frontend (platform fee 0). v4 circles stay on their code ids."
 }
