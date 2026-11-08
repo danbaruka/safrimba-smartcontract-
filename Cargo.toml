@@ -1,6 +1,6 @@
 [package]
 name = "safrimba-contract"
-version = "0.2.0"
+version = "0.5.1"
 edition = "2021"
 
 [lib]
@@ -20,9 +20,15 @@ thiserror = "1.0"
 cw-storage-plus = "1.1"
 cw-utils = "1.0"
 cw2 = "1.1"
+sha2 = { version = "0.10", default-features = false }
 
 [profile.release]
 opt-level = "s"
 lto = true
 codegen-units = 1
+overflow-checks = true
 
+
+[dev-dependencies]
+cw-multi-test = "1.2"
+anyhow = "1"

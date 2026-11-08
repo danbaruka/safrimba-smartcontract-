@@ -3,7 +3,7 @@
 ## State Machine Overview
 
 ```
-Draft → Open → Full → Running → (Paused) → Completed
+Draft → Open → Full → Running → (Paused) → Finalizing → Completed
   ↓                              ↓
 Cancelled ←─────────────────────┘
 ```
@@ -83,17 +83,38 @@ Cancelled ←─────────────────────┘
 
 **Allowed Actions**:
 - DepositContribution (by members)
-- ProcessPayout (by contract/arbiter/creator)
-- PauseCircle (if emergency_stop_enabled)
-- BlockMember (by creator/arbiter)
-- DistributeBlockedFunds
+- ProcessPayout (permissionless when manual_trigger_enabled=false and timing gates pass)
+- AdvanceRound (when all deposited but distribution threshold not yet reached)
+- Withdraw (members with pending payouts)
+- CheckAndEject (permissionless)
+- PauseCircle (creator)
+- BlockMember (creator)
+- DistributeBlockedFunds (creator)
+- CancelCircle (creator, if no distribution yet)
 
 **Transition To**:
 - **Paused**: Emergency stop or manual pause
-- **Completed**: All cycles finished
-- **Cancelled**: Emergency cancellation
+- **Finalizing**: All cycles finished; final distributions credited to PENDING_PAYOUTS
+- **Cancelled**: If cancelled before any distribution
 
-### 5. Paused (Temporary Halt)
+### 5. Finalizing (Awaiting Withdrawals)
+**When**: All rounds complete; final distributions credited to PENDING_PAYOUTS
+**Characteristics**:
+- Members must call Withdraw to receive allocated funds
+- Platform may call DepositCreatorReward (once per circle)
+- Circle becomes Completed when contract balance reaches zero
+
+**Allowed Actions**:
+- Withdraw (members)
+- DepositCreatorReward (platform-funded, attach funds)
+- WithdrawPlatformFees (permissionless)
+- SweepDust (permissionless, after all members withdrew)
+- CheckAndEject (if needed)
+
+**Transition To**:
+- **Completed**: Contract balance = 0 (all pending payouts withdrawn, fees swept)
+
+### 6. Paused (Temporary Halt)
 **When**: Circle paused due to emergency or manual intervention
 **Characteristics**:
 - All operations frozen
@@ -110,7 +131,7 @@ Cancelled ←─────────────────────┘
 - **Running**: UnpauseCircle
 - **Cancelled**: If refund needed
 
-### 6. Completed (Success!)
+### 7. Completed (Success!)
 **When**: All cycles finished successfully
 **Characteristics**:
 - All distributions made
@@ -121,11 +142,12 @@ Cancelled ←─────────────────────┘
 **Allowed Actions**:
 - Query data
 - View history
-- Platform fee withdrawal
+- WithdrawPlatformFees
+- SweepDust (if residual balance)
 
-**Final State**: No transitions
+**Final State**: No transitions (unless SweepDust re-opens Finalizing for creator withdrawal)
 
-### 7. Cancelled (Terminated)
+### 8. Cancelled (Terminated)
 **When**: Circle cancelled before completion
 **Characteristics**:
 - Refunds processed
@@ -186,6 +208,7 @@ Draft      → Gray badge
 Open       → Blue badge (accepting members)
 Full       → Yellow badge (ready to start)
 Running    → Green badge (active)
+Finalizing → Indigo badge (awaiting withdrawals)
 Paused     → Orange badge (frozen)
 Completed  → Purple badge (finished)
 Cancelled  → Red badge (terminated)
@@ -205,6 +228,9 @@ Full (10/10 members):
 
 Running:
 [✅ Creation] [✅ Registration] [✅ Deposit] [🔄 Distribution] [⏳ Completion]
+
+Finalizing:
+[✅ Creation] [✅ Registration] [✅ Deposit] [✅ Distribution] [🔄 Completion]
 
 Completed:
 [✅ Creation] [✅ Registration] [✅ Deposit] [✅ Distribution] [✅ Completion]
@@ -230,8 +256,14 @@ Completed:
 
 **Running**:
 - [Deposit Now] (members, if cycle active)
-- [Process Payout] (if manual_trigger)
-- [Pause Circle] (creator/arbiter)
+- [Process Payout] (if manual_trigger or permissionless)
+- [Advance Round] (pre-distribution threshold)
+- [Withdraw] (members with pending payouts)
+- [Pause Circle] (creator)
+
+**Finalizing**:
+- [Withdraw] (members)
+- [View Stats]
 
 **Paused**:
 - [Unpause Circle] (creator/arbiter)

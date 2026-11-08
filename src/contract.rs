@@ -1,23 +1,22 @@
-use cosmwasm_std::{entry_point, Binary, Deps, DepsMut, Env, MessageInfo, Order, Response, StdResult};
+use cosmwasm_std::{
+    entry_point, to_json_binary, Binary, Deps, DepsMut, Env, Event, MessageInfo, Reply,
+    Response, StdResult, SubMsgResult, Uint128,
+};
 use cw2::{get_contract_version, set_contract_version};
 
 use crate::error::ContractError;
 use crate::msg::{ContractVersionResponse, ExecuteMsg, InstantiateMsg, MigrateMsg, QueryMsg};
-use crate::query::{
-    query_circle, query_circle_balance, query_circle_members, query_circle_stats,
-    query_circle_status, query_current_cycle, query_cycle_deposits, query_deposit_requirement,
-    query_events, query_member_balance, query_member_deposits, query_member_stats,
-    query_payout_history, query_payouts, query_penalties, query_refunds, query_circles,
-    query_member_locked_amount, query_blocked_members, query_member_pseudonym,
-    query_private_members, query_distribution_calendar, query_archived_date, query_pending_payout,
-    query_member_accumulated_late_fees,
+use crate::query::*;
+use crate::state::{
+    CircleStatus, PlatformConfig, CIRCLES, PENDING_PAYOUTS, PLATFORM_CONFIG, SEND_BATCH,
 };
-use crate::state::{CircleStatus, DistributionThreshold, PlatformConfig, CIRCLES};
 
 const CONTRACT_NAME: &str = "crates.io:safrimba-contract";
 const CONTRACT_VERSION: &str = env!("CARGO_PKG_VERSION");
-/// API version for frontend capabilities: 1 = v1 (join + lock_deposit), 2 = v2 (join with funds, pending payouts, etc.)
-const CONTRACT_API_VERSION: u8 = 2;
+/// 5 = time-driven engine: GetCircleView, Tick, pushed payouts, lazy settlement.
+pub const CONTRACT_API_VERSION: u8 = 5;
+/// Platform fee hard cap (basis points).
+const MAX_PLATFORM_FEE_BPS: u64 = 2_000;
 
 #[entry_point]
 pub fn instantiate(
@@ -27,19 +26,22 @@ pub fn instantiate(
     msg: InstantiateMsg,
 ) -> Result<Response, ContractError> {
     set_contract_version(deps.storage, CONTRACT_NAME, CONTRACT_VERSION)?;
-
-    // Validate platform address
+    if msg.platform_fee_percent > MAX_PLATFORM_FEE_BPS {
+        return Err(ContractError::InvalidParameters {
+            msg: format!("platform_fee_percent cannot exceed {}", MAX_PLATFORM_FEE_BPS),
+        });
+    }
     let platform_address = deps.api.addr_validate(msg.platform_address.as_str())?;
-
-    // Store platform configuration
-    let platform_config = PlatformConfig {
-        platform_fee_percent: msg.platform_fee_percent,
-        platform_address: platform_address.clone(),
-    };
-    crate::state::PLATFORM_CONFIG.save(deps.storage, &platform_config)?;
-
+    PLATFORM_CONFIG.save(
+        deps.storage,
+        &PlatformConfig {
+            platform_fee_percent: msg.platform_fee_percent,
+            platform_address: platform_address.clone(),
+        },
+    )?;
     Ok(Response::new()
         .add_attribute("method", "instantiate")
+        .add_attribute("engine", crate::state::ENGINE_VERSION.to_string())
         .add_attribute("platform_address", platform_address.to_string())
         .add_attribute("platform_fee_percent", msg.platform_fee_percent.to_string()))
 }
@@ -54,211 +56,169 @@ pub fn execute(
     crate::execute::execute(deps, env, info, msg)
 }
 
+/// Every bank send is a sub-message with `reply_on_error` (PLAN_V5 C5): a send
+/// the chain refuses (blocked module account, …) must not revert the settlement
+/// of everyone else. The amount stays in the contract, credited to the
+/// recipient's pending ledger, and is released by `Withdraw`.
+#[entry_point]
+pub fn reply(deps: DepsMut, _env: Env, msg: Reply) -> Result<Response, ContractError> {
+    let SubMsgResult::Err(error) = msg.result else {
+        return Ok(Response::new());
+    };
+    let batch = SEND_BATCH.load(deps.storage)?;
+    let (to, amount) = batch
+        .sends
+        .get(msg.id as usize)
+        .cloned()
+        .ok_or_else(|| ContractError::InvalidParameters {
+            msg: format!("unknown send reply id {}", msg.id),
+        })?;
+    PENDING_PAYOUTS.update(deps.storage, (batch.circle_id, to.clone()), |v| -> StdResult<Uint128> {
+        Ok(v.unwrap_or_default() + amount)
+    })?;
+    let mut circle = CIRCLES.load(deps.storage, batch.circle_id)?;
+    circle.total_pending_payouts += amount;
+    // A completed circle that still owes a withdrawal is Finalizing until
+    // `Withdraw` releases it (same as when the debt existed before closing).
+    if circle.circle_status == CircleStatus::Completed {
+        circle.circle_status = CircleStatus::Finalizing;
+    }
+    CIRCLES.save(deps.storage, batch.circle_id, &circle)?;
+    let error: String = error.chars().take(200).collect();
+    Ok(Response::new()
+        .add_attribute("action", "payout_deferred")
+        .add_event(
+            Event::new("safrimba_payout_deferred")
+                .add_attribute("circle_id", batch.circle_id.to_string())
+                .add_attribute("to", to.to_string())
+                .add_attribute("amount", amount.to_string())
+                .add_attribute("denom", batch.denom)
+                .add_attribute("error", error),
+        ))
+}
+
+/// Same-engine upgrades only. A v4 instance keeps its v4 state layout and must
+/// stay on the v4 code id (the keeper drives both engines): converting a live
+/// v4 ledger in place would silently re-interpret members' money.
 #[entry_point]
 pub fn migrate(deps: DepsMut, _env: Env, _msg: MigrateMsg) -> Result<Response, ContractError> {
-    let version = get_contract_version(deps.storage)?;
-    set_contract_version(
-        deps.storage,
-        CONTRACT_NAME,
-        CONTRACT_VERSION,
-    )?;
-
-    // Per-circle backfills. We make the migration idempotent (every save is
-    // conditional on a stored value being unset/inconsistent) so re-running
-    // migrate is a no-op.
-    let ids: Vec<u64> = CIRCLES
-        .keys(deps.storage, None, None, Order::Ascending)
-        .filter_map(|r| r.ok())
-        .collect();
-    let mut members_at_start_backfilled: u32 = 0;
-    let mut threshold_backfilled: u32 = 0;
-    let mut status_healed: u32 = 0;
-    let mut denomination_backfilled: u32 = 0;
-    for id in ids {
-        let mut circle = CIRCLES.load(deps.storage, id)?;
-        let mut dirty = false;
-
-        // 1) `members_at_start` for circles that auto-started via
-        // `auto_start_when_full + by_members` before that field was being set.
-        // Without this, scaled max_missed_payments_allowed computations on
-        // subsequent ejections fall back to the unscaled base, AND the new
-        // total_rounds calculation in execute_process_payout falls back to
-        // max_members (the pre-fix behavior).
-        if matches!(circle.circle_status, CircleStatus::Running)
-            && circle.members_at_start.is_none()
-        {
-            circle.members_at_start = Some(circle.members_list.len() as u32);
-            members_at_start_backfilled += 1;
-            dirty = true;
-        }
-
-        // 2) Pin `distribution_threshold` to an explicit value. The new code
-        // treats `None` exactly like `Total` (last round of cycle distributes
-        // and splits among all active members). Backfilling makes the field
-        // explicit so future code paths, queries, and the calendar agree —
-        // and so the UI never has to guess what `None` means.
-        if circle.distribution_threshold.is_none() {
-            circle.distribution_threshold = Some(DistributionThreshold::Total {});
-            threshold_backfilled += 1;
-            dirty = true;
-        }
-
-        // 3) Heal circles stuck in Running after their last calendar round.
-        // The pre-fix `total_rounds = max_members * total_cycles` allowed
-        // `current_cycle_index` to advance past the calendar's real end
-        // (active_members * total_cycles) without flipping status to
-        // Finalizing. We detect that state and flip it here so the cron stops
-        // queuing phantom rounds and members can withdraw.
-        if matches!(circle.circle_status, CircleStatus::Running) {
-            let basis = circle.members_at_start.unwrap_or(circle.max_members);
-            let real_total_rounds = basis * circle.total_cycles;
-            let overshoot = circle.current_cycle_index >= real_total_rounds
-                || circle.cycles_completed >= circle.total_cycles;
-            if overshoot {
-                circle.circle_status = CircleStatus::Finalizing;
-                status_healed += 1;
-                dirty = true;
-            }
-        }
-
-        // 4) Backfill empty `denomination`. Older circles persisted without
-        // a denomination field (early schema) deserialize to `""`. Treat any
-        // missing/empty value as native SAF (`"usaf"`) to keep deposit/payout/
-        // refund denoms valid. Per-circle allow-list is enforced at
-        // CreateCircle for new circles.
-        if circle.denomination.is_empty() {
-            circle.denomination = "usaf".to_string();
-            denomination_backfilled += 1;
-            dirty = true;
-        }
-
-        if dirty {
-            CIRCLES.save(deps.storage, id, &circle)?;
-        }
+    let previous = get_contract_version(deps.storage)?;
+    let major_minor = |v: &str| -> (u64, u64) {
+        let mut it = v.split('.').map(|p| p.parse::<u64>().unwrap_or(0));
+        (it.next().unwrap_or(0), it.next().unwrap_or(0))
+    };
+    if previous.contract != CONTRACT_NAME {
+        return Err(ContractError::InvalidParameters {
+            msg: format!("cannot migrate from {}", previous.contract),
+        });
     }
-
+    if major_minor(&previous.version) < (0, 5) {
+        return Err(ContractError::InvalidParameters {
+            msg: format!(
+                "in-place migration from engine v4 ({}) is not supported; keep v4 circles on their code id",
+                previous.version
+            ),
+        });
+    }
+    set_contract_version(deps.storage, CONTRACT_NAME, CONTRACT_VERSION)?;
     Ok(Response::new()
         .add_attribute("action", "migrate")
-        .add_attribute("previous_version", version.version)
-        .add_attribute("new_version", CONTRACT_VERSION)
-        .add_attribute("members_at_start_backfilled", members_at_start_backfilled.to_string())
-        .add_attribute("distribution_threshold_backfilled", threshold_backfilled.to_string())
-        .add_attribute("running_status_healed", status_healed.to_string())
-        .add_attribute("denomination_backfilled", denomination_backfilled.to_string()))
+        .add_attribute("previous_version", previous.version)
+        .add_attribute("new_version", CONTRACT_VERSION))
 }
 
 #[entry_point]
 pub fn query(deps: Deps, env: Env, msg: QueryMsg) -> StdResult<Binary> {
     match msg {
-        QueryMsg::GetCircle { circle_id } => {
-            cosmwasm_std::to_json_binary(&query_circle(deps, env, circle_id)?)
+        QueryMsg::GetCircleView { circle_id, member } => {
+            to_json_binary(&query_circle_view(deps, env, circle_id, member)?)
         }
+        QueryMsg::GetCircle { circle_id } => to_json_binary(&query_circle(deps, env, circle_id)?),
         QueryMsg::GetCircles {
             start_after,
             limit,
             status,
             creator,
-        } => cosmwasm_std::to_json_binary(&query_circles(
-            deps, env, start_after, limit, status, creator,
-        )?),
+        } => to_json_binary(&query_circles(deps, env, start_after, limit, status, creator)?),
         QueryMsg::GetCircleMembers { circle_id } => {
-            cosmwasm_std::to_json_binary(&query_circle_members(deps, env, circle_id)?)
+            to_json_binary(&query_circle_members(deps, env, circle_id)?)
         }
         QueryMsg::GetCircleStatus { circle_id } => {
-            cosmwasm_std::to_json_binary(&query_circle_status(deps, env, circle_id)?)
+            to_json_binary(&query_circle_status(deps, env, circle_id)?)
         }
         QueryMsg::GetCurrentCycle { circle_id } => {
-            cosmwasm_std::to_json_binary(&query_current_cycle(deps, env, circle_id)?)
+            to_json_binary(&query_current_cycle(deps, env, circle_id)?)
         }
         QueryMsg::GetCycleDeposits { circle_id, cycle } => {
-            cosmwasm_std::to_json_binary(&query_cycle_deposits(deps, env, circle_id, cycle)?)
+            to_json_binary(&query_cycle_deposits(deps, env, circle_id, cycle)?)
         }
         QueryMsg::GetMemberDeposits { circle_id, member } => {
-            cosmwasm_std::to_json_binary(&query_member_deposits(deps, env, circle_id, member)?)
+            to_json_binary(&query_member_deposits(deps, env, circle_id, member)?)
         }
-        QueryMsg::GetPayouts { circle_id } => {
-            cosmwasm_std::to_json_binary(&query_payouts(deps, env, circle_id)?)
-        }
+        QueryMsg::GetPayouts { circle_id } => to_json_binary(&query_payouts(deps, env, circle_id)?),
         QueryMsg::GetPayoutHistory { circle_id, cycle } => {
-            cosmwasm_std::to_json_binary(&query_payout_history(deps, env, circle_id, cycle)?)
+            to_json_binary(&query_payout_history(deps, env, circle_id, cycle)?)
         }
         QueryMsg::GetCircleBalance { circle_id } => {
-            cosmwasm_std::to_json_binary(&query_circle_balance(deps, env, circle_id)?)
+            to_json_binary(&query_circle_balance(deps, env, circle_id)?)
         }
         QueryMsg::GetMemberBalance { circle_id, member } => {
-            cosmwasm_std::to_json_binary(&query_member_balance(deps, env, circle_id, member)?)
+            to_json_binary(&query_member_balance(deps, env, circle_id, member)?)
         }
         QueryMsg::GetPenalties { circle_id, member } => {
-            cosmwasm_std::to_json_binary(&query_penalties(deps, env, circle_id, member)?)
+            to_json_binary(&query_penalties(deps, env, circle_id, member)?)
         }
-        QueryMsg::GetRefunds { circle_id } => {
-            cosmwasm_std::to_json_binary(&query_refunds(deps, env, circle_id)?)
+        QueryMsg::GetRefunds { circle_id } => to_json_binary(&query_refunds(deps, env, circle_id)?),
+        QueryMsg::GetPendingPayout { circle_id, member } => {
+            to_json_binary(&query_pending_payout(deps, env, circle_id, member)?)
+        }
+        QueryMsg::GetMemberAccumulatedLateFees { circle_id, member } => to_json_binary(
+            &query_member_accumulated_late_fees(deps, env, circle_id, member)?,
+        ),
+        QueryMsg::GetDepositRequirement { circle_id, member } => {
+            to_json_binary(&query_deposit_requirement(deps, env, circle_id, member)?)
         }
         QueryMsg::GetEvents { circle_id, limit } => {
-            cosmwasm_std::to_json_binary(&query_events(deps, env, circle_id, limit)?)
+            to_json_binary(&query_events(deps, env, circle_id, limit)?)
         }
         QueryMsg::GetCircleStats { circle_id } => {
-            cosmwasm_std::to_json_binary(&query_circle_stats(deps, env, circle_id)?)
+            to_json_binary(&query_circle_stats(deps, env, circle_id)?)
         }
         QueryMsg::GetMemberStats { circle_id, member } => {
-            cosmwasm_std::to_json_binary(&query_member_stats(deps, env, circle_id, member)?)
+            to_json_binary(&query_member_stats(deps, env, circle_id, member)?)
         }
         QueryMsg::GetMemberLockedAmount { circle_id, member } => {
-            cosmwasm_std::to_json_binary(&query_member_locked_amount(deps, env, circle_id, member)?)
+            to_json_binary(&query_member_locked_amount(deps, env, circle_id, member)?)
         }
         QueryMsg::GetBlockedMembers { circle_id } => {
-            cosmwasm_std::to_json_binary(&query_blocked_members(deps, env, circle_id)?)
+            to_json_binary(&query_blocked_members(deps, env, circle_id)?)
         }
         QueryMsg::GetMemberPseudonym { circle_id, member } => {
-            cosmwasm_std::to_json_binary(&query_member_pseudonym(deps, env, circle_id, member)?)
+            to_json_binary(&query_member_pseudonym(deps, env, circle_id, member)?)
         }
         QueryMsg::GetPrivateMembers { circle_id } => {
-            cosmwasm_std::to_json_binary(&query_private_members(deps, env, circle_id)?)
+            to_json_binary(&query_private_members(deps, env, circle_id)?)
         }
         QueryMsg::GetDistributionCalendar { circle_id } => {
-            cosmwasm_std::to_json_binary(&query_distribution_calendar(deps, env, circle_id)?)
+            to_json_binary(&query_distribution_calendar(deps, env, circle_id)?)
         }
         QueryMsg::GetArchivedDate { circle_id } => {
-            cosmwasm_std::to_json_binary(&query_archived_date(deps, env, circle_id)?)
+            to_json_binary(&query_archived_date(deps, env, circle_id)?)
         }
-        QueryMsg::GetPendingPayout { circle_id, member } => {
-            cosmwasm_std::to_json_binary(&query_pending_payout(deps, env, circle_id, member)?)
+        QueryMsg::GetLockReserve { circle_id, member } => {
+            to_json_binary(&query_lock_reserve(deps, env, circle_id, member)?)
         }
-        QueryMsg::GetMemberAccumulatedLateFees { circle_id, member } => {
-            cosmwasm_std::to_json_binary(&query_member_accumulated_late_fees(
-                deps, env, circle_id, member,
-            )?)
+        QueryMsg::GetLockReserves { circle_id } => {
+            to_json_binary(&query_lock_reserves(deps, env, circle_id)?)
         }
-        QueryMsg::GetDepositRequirement { circle_id, member } => {
-            cosmwasm_std::to_json_binary(&query_deposit_requirement(
-                deps, env, circle_id, member,
-            )?)
+        QueryMsg::PreviewEndCycle { circle_id } => {
+            to_json_binary(&query_preview_end_cycle(deps, env, circle_id)?)
         }
-        QueryMsg::GetContractVersion {} => cosmwasm_std::to_json_binary(&ContractVersionResponse {
+        QueryMsg::GetWalletReputation { address } => {
+            to_json_binary(&query_wallet_reputation(deps, env, address)?)
+        }
+        QueryMsg::GetContractVersion {} => to_json_binary(&ContractVersionResponse {
             api_version: CONTRACT_API_VERSION,
         }),
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use cosmwasm_std::testing::{mock_dependencies, mock_env, mock_info};
-    use cosmwasm_std::{coins, Addr};
-
-    #[test]
-    fn proper_initialization() {
-        let mut deps = mock_dependencies();
-        let env = mock_env();
-        let info = mock_info("creator", &coins(1000, "saf"));
-
-        let msg = InstantiateMsg {
-            platform_fee_percent: 100, // 1%
-            platform_address: Addr::unchecked("platform"),
-        };
-
-        let res = instantiate(deps.as_mut(), env, info, msg).unwrap();
-        assert_eq!(0, res.messages.len());
-    }
-}
-

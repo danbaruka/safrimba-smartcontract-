@@ -4,7 +4,7 @@
 [![CosmWasm](https://img.shields.io/badge/CosmWasm-1.5-blue.svg)](https://github.com/CosmWasm/cosmwasm)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
-A CosmWasm smart contract implementing a digital tontine system on Safrochain. The contract manages all deposits, rules, and payouts in SAF tokens automatically.
+A CosmWasm smart contract implementing a digital tontine system on Safrochain. The contract manages all deposits, rules, and payouts automatically in the circle's chosen token (`usaf` native SAF or Noble IBC USDC).
 
 ## Table of contents
 
@@ -25,7 +25,9 @@ A CosmWasm smart contract implementing a digital tontine system on Safrochain. T
 - **Penalty System**: Late fees and penalties for missed payments
 - **Security Controls**: Emergency stop, arbitration, and pause/unpause functionality
 - **Transparent Tracking**: On-chain event logging for all operations
-- **Flexible Membership**: Public or invite-only circles with configurable member limits
+- **Multi-Token Circles**: Native SAF (`usaf`) or Noble IBC USDC, fixed at creation via `denomination`
+- **Pending Payout Model**: v2 credits payouts to `PENDING_PAYOUTS`; members call `Withdraw` to receive funds
+- **Platform Operations**: Creator rewards, dust sweep, and platform fee recovery on finalized circles
 
 ## Contract structure
 
@@ -38,7 +40,8 @@ A CosmWasm smart contract implementing a digital tontine system on Safrochain. T
 
 ## Documentation
 
-- [Contract states and flow](CONTRACT_STATES_EXPLAINED.md) – State machine (Draft → Open → Full → Running → Completed/Cancelled), allowed actions, and frontend integration.
+- [Contract states and flow](CONTRACT_STATES_EXPLAINED.md) – State machine (Draft → Open → Full → Running → Finalizing → Completed/Cancelled), allowed actions, and frontend integration.
+- [Pending payouts & distribution](../docs/CIRCLE_PENDING_PAYOUTS_AND_DISTRIBUTION.md) – How `PENDING_PAYOUTS`, `Withdraw`, and UI totals relate.
 - [Build and deployment fixes](FIXES.md) – Known fixes (reference-types, optimizer) and deployment notes.
 - [Deployment scripts](scripts/README.md) – Deploy to testnet/mainnet with `deploy.sh`.
 - [Testing](scripts/README_TEST.md) – Test scripts for create circle, distribution threshold, and full actions.
@@ -123,6 +126,7 @@ safrochaind tx wasm instantiate <code-id> \
     "max_members": 10,
     "min_members_required": 5,
     "contribution_amount": "1000000",
+    "denomination": "usaf",
     "total_cycles": 10,
     "cycle_duration_days": 30,
     "payout_order_type": "random_order",
@@ -164,6 +168,40 @@ Send SAF tokens along with:
 }
 ```
 
+### Withdrawing Pending Payouts (v2)
+
+After `ProcessPayout`, funds are credited to `PENDING_PAYOUTS`. Members must call:
+
+```json
+{
+  "withdraw": {
+    "circle_id": 1
+  }
+}
+```
+
+### Advance Round (pre-distribution threshold)
+
+When distribution has not yet started for the cycle (e.g. `Total` threshold at round 1):
+
+```json
+{
+  "advance_round": {
+    "circle_id": 1
+  }
+}
+```
+
+### Platform / recovery messages
+
+```json
+{ "withdraw_platform_fees": { "circle_id": 1 } }
+{ "sweep_dust": { "circle_id": 1 } }
+{ "deposit_creator_reward": { "circle_id": 1 } }
+```
+
+Attach funds in the circle denomination for `deposit_creator_reward`. Callable once per circle at `Finalizing` status.
+
 ## Query Examples
 
 ### Get Circle Information
@@ -192,6 +230,46 @@ Send SAF tokens along with:
 {
   "get_current_cycle": {
     "circle_id": 1
+  }
+}
+```
+
+### Get Pending Payout
+
+```json
+{
+  "get_pending_payout": {
+    "circle_id": 1,
+    "member": "addr_safro..."
+  }
+}
+```
+
+### Get Contract Version
+
+```json
+{
+  "get_contract_version": {}
+}
+```
+
+### Get Circle Stats
+
+```json
+{
+  "get_circle_stats": {
+    "circle_id": 1
+  }
+}
+```
+
+### Get Events
+
+```json
+{
+  "get_events": {
+    "circle_id": 1,
+    "limit": 50
   }
 }
 ```

@@ -205,7 +205,7 @@ private_circle_base() {
 # ── DENOMINATION NEGATIVE TESTS ──────────────────────────────────────────────
 # A bad denom is rejected at CreateCircle (allow-list: 'usaf' or the IBC USDC trace).
 
-USDC_DENOM='ibc/2180E84E20F5679FCC760D8C165B60F42065DEF7F46A72B447CFF1B7DC6C0A65'
+USDC_DENOM='ibc/FC6C34533ECF1AAD296E41A70D8F16089E90D436904B56EDE19342D6DE172B82'
 
 log "${CYAN}[2a] DENOMINATION ALLOW-LIST — bad denom rejected${NC}"
 do_bad_denom_should_fail() {

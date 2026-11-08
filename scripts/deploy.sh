@@ -65,12 +65,17 @@ PLATFORM_ADDRESS="${5:-$ADMIN_ADDRESS}"
 #
 #   KEYRING_BACKEND=test ./scripts/deploy.sh testnet
 #   KEYRING_BACKEND=file ./scripts/deploy.sh testnet
+#   KEYRING_DIR=/path/to/keyring KEYRING_BACKEND=test ./scripts/deploy.sh mainnet <key_name>
 #
 # Every safrochaind call below threads `$KEYRING_OPTS` so the choice is honored
 # at both `keys show` time AND `tx wasm store` time (the historic skew between
 # the two is what made the script appear to "hang" at step 3).
 KEYRING_BACKEND="${KEYRING_BACKEND:-os}"
+KEYRING_DIR="${KEYRING_DIR:-}"
 KEYRING_OPTS="--keyring-backend $KEYRING_BACKEND"
+if [[ -n "$KEYRING_DIR" ]]; then
+    KEYRING_OPTS="$KEYRING_OPTS --keyring-dir $KEYRING_DIR"
+fi
 
 # Validate network
 if [[ "$NETWORK" != "testnet" && "$NETWORK" != "mainnet" ]]; then
@@ -697,10 +702,13 @@ FRONTEND_CHAIN_CONFIG="$FRONTEND_DIR/chain/$NETWORK/safrochain.json"
 if [[ -f "$FRONTEND_CHAIN_CONFIG" ]]; then
     # Create backup
     cp "$FRONTEND_CHAIN_CONFIG" "$FRONTEND_CHAIN_CONFIG.bak"
-    # Update codeId using jq
-    jq ".codeId = $CODE_ID" "$FRONTEND_CHAIN_CONFIG" > "$FRONTEND_CHAIN_CONFIG.tmp" && mv "$FRONTEND_CHAIN_CONFIG.tmp" "$FRONTEND_CHAIN_CONFIG"
+    # Update codeId and the API generation of that code (the create form and the
+    # UI read `codeApiVersion`: without it a v5 code id is treated as v4).
+    API_VERSION=$(grep -E 'CONTRACT_API_VERSION: u8 = [0-9]+' "$CONTRACT_DIR/src/contract.rs" | grep -oE '[0-9]+;' | tr -d ';')
+    API_VERSION="${API_VERSION:-5}"
+    jq ".codeId = $CODE_ID | .codeApiVersion = $API_VERSION" "$FRONTEND_CHAIN_CONFIG" > "$FRONTEND_CHAIN_CONFIG.tmp" && mv "$FRONTEND_CHAIN_CONFIG.tmp" "$FRONTEND_CHAIN_CONFIG"
     echo -e "${GREEN}Updated codeId in: ${YELLOW}$FRONTEND_CHAIN_CONFIG${NC}"
-    echo -e "  ${GREEN}codeId: ${YELLOW}$CODE_ID${NC}"
+    echo -e "  ${GREEN}codeId: ${YELLOW}$CODE_ID${NC}  codeApiVersion: ${YELLOW}$API_VERSION${NC}"
 else
     echo -e "${YELLOW}Warning: Frontend chain config not found at $FRONTEND_CHAIN_CONFIG${NC}"
     echo -e "${YELLOW}Please update codeId manually in the chain config file.${NC}"
@@ -774,11 +782,16 @@ echo -e "Saved to: ${YELLOW}$ENV_LOCAL_FILE${NC}"
 # Also save deployment info to contract directory
 echo -e "\n${GREEN}Saving deployment info...${NC}"
 DEPLOYMENT_INFO="$CONTRACT_DIR/deployment-$NETWORK.json"
+CRATE_VERSION=$(grep -m1 '^version' "$CONTRACT_DIR/Cargo.toml" | cut -d'"' -f2)
+WASM_SHA256=$( (shasum -a 256 "$OPTIMIZED_WASM" 2>/dev/null || sha256sum "$OPTIMIZED_WASM") | cut -d' ' -f1)
 cat > "$DEPLOYMENT_INFO" <<EOF
 {
   "network": "$NETWORK",
   "chainId": "$CHAIN_ID",
   "codeId": "$CODE_ID",
+  "apiVersion": ${API_VERSION:-5},
+  "contractVersion": "$CRATE_VERSION",
+  "wasmSha256": "$WASM_SHA256",
   "adminAddress": "$ADMIN_ADDRESS",
   "platformFeePercent": $PLATFORM_FEE_PERCENT,
   "platformAddress": "$PLATFORM_ADDRESS",
@@ -800,4 +813,8 @@ echo -e "\n${GREEN}Contract code uploaded successfully!${NC}"
 echo -e "${YELLOW}Existing circles are NOT migrated. To upgrade one, run:${NC}"
 echo -e "  ${YELLOW}./scripts/deploy.sh migrate $NETWORK <contract_address> $CODE_ID${NC}"
 echo -e "Frontend .env file updated: ${YELLOW}$ENV_LOCAL_FILE${NC}"
+echo -e "\n${YELLOW}Next (PLAN_V5 T11):${NC}"
+echo -e "  - add ${GREEN}$CODE_ID${NC} to VITE_V5_CODE_IDS (frontend build) and SAFRIMBA_CODE_IDS (jobs/API env)"
+echo -e "  - jobs unit: WORKER_ROLE=pulse (or all + PULSE_SIGNER=true); API: observer only"
+echo -e "  - nginx -t && reload (stream, X-Forwarded-For, limits, CSP); then the T12 checklist"
 

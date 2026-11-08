@@ -6,6 +6,9 @@ pub enum ContractError {
     #[error("{0}")]
     Std(#[from] StdError),
 
+    #[error("{0}")]
+    Payment(#[from] cw_utils::PaymentError),
+
     #[error("Unauthorized: {msg}")]
     Unauthorized { msg: String },
 
@@ -27,11 +30,20 @@ pub enum ContractError {
     #[error("Insufficient funds. Required: {required}, Sent: {sent}")]
     InsufficientFunds { required: String, sent: String },
 
+    #[error("Invalid payment: send between {min} and {max}, sent {sent}")]
+    InvalidPayment { min: String, max: String, sent: String },
+
     #[error("Circle has not started yet")]
     CircleNotStarted { circle_id: u64 },
 
-    #[error("Circle has already started. Voluntary exit not allowed (strict mode); use automatic ejection when rules apply")]
+    #[error("Strict mode: voluntary exits are only possible right after a cycle ends")]
     StrictModeNoExit { circle_id: u64 },
+
+    #[error("Member {member} is up to date (no missed round, no arrears): an admin can only eject for cause")]
+    NoCause { member: String },
+
+    #[error("Pause budget exhausted: this circle has already been paused for the maximum total time")]
+    PauseBudgetExhausted {},
 
     #[error("Exit not allowed")]
     ExitNotAllowed { circle_id: u64 },
@@ -39,38 +51,26 @@ pub enum ContractError {
     #[error("Minimum members not met. Required: {required}, Current: {current}")]
     MinMembersNotMet { required: u32, current: u32 },
 
-    #[error("Cycle not ready. Round ends at: {next_date}")]
-    CycleNotReady { next_date: u64 },
+    #[error("Round {round} is not open yet. It opens at {opens_at}")]
+    RoundNotOpen { round: u32, opens_at: u64 },
 
-    #[error("Member has not paid for this cycle")]
-    PaymentMissing { address: String, cycle: u32 },
+    #[error("Every round is already paid")]
+    NothingToPay {},
 
-    #[error("Maximum missed payments exceeded: {max}")]
-    MaxMissedPaymentsExceeded { max: u32 },
+    #[error("Nothing to settle yet. Next automatic action at: {next_action_at}")]
+    NothingToDo { next_action_at: u64 },
 
-    #[error("Invalid payout order type")]
-    InvalidPayoutOrderType {},
+    #[error("The circle is catching up on overdue rounds. Send Tick, then retry.")]
+    CatchingUp {},
 
-    #[error("Invalid cycle index: {index}")]
-    InvalidCycleIndex { index: u32 },
-
-    #[error("Emergency stop is active")]
-    EmergencyStopActive {},
+    #[error("Removed in engine v5: {msg}")]
+    Removed { msg: String },
 
     #[error("Invalid parameters: {msg}")]
     InvalidParameters { msg: String },
 
-    #[error("Deposit already made for this cycle")]
-    AlreadyDeposited { address: String, cycle: u32 },
-
     #[error("No pending payouts available for withdrawal")]
     NoPendingPayouts {},
-
-    #[error("Contract balance insufficient for payout. Required: {required}, Available: {available}")]
-    InsufficientContractBalance { required: String, available: String },
-
-    #[error("Payout already processed for this cycle")]
-    PayoutAlreadyProcessed { cycle: u32 },
 
     #[error("Cannot cancel: at least one distribution has occurred. Circle must complete or use emergency procedures.")]
     CancelNotAllowedAfterDistribution {},

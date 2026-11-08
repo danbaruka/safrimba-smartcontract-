@@ -1,0 +1,15 @@
+{
+  "network": "mainnet",
+  "chainId": "safrochain-1",
+  "codeId": "7",
+  "creator": "addr_safro14xhtytuayp3ywayxus5j2jha40ryq4j7aamyve",
+  "instantiatePermission": "Everybody",
+  "apiVersion": 4,
+  "contractVersion": "0.4.0",
+  "deployedAt": "2026-08-15T15:35:00Z",
+  "storeTx": "664CFA4EAC8C895C1A4AFDDA06C0533CCF7FFCDF78367BB054B0CE184FAFA811",
+  "storeHeight": "1624740",
+  "dataHash": "4AED4130798B7C03C2E68B88D14915C731FFC7869491A6F8B05CEEF61BE36C70",
+  "wasmFile": "safrimba_contract.wasm",
+  "note": "Code store only. Circle instances are created by the frontend per circle. platform_fee stays 0. x/feeshare is still disabled on mainnet."
+}
